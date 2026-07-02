@@ -1,5 +1,7 @@
 # ICON in Python Demo
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ofuhrer/icon4py_demo/blob/main/icon4py_demo.ipynb)
+
 This directory contains a local notebook domenstrating ICON in Python.
 
 ## Setup
@@ -46,7 +48,12 @@ kernel if needed.
 For non-interactive validation, run:
 
 ```bash
+mkdir -p /tmp/icon4py-demo-nbconvert
 PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m nbconvert \
-  --execute --to notebook --inplace \
+  --execute --to notebook \
+  --output-dir /tmp/icon4py-demo-nbconvert \
+  --output icon4py_demo.executed.ipynb \
   icon4py_demo.ipynb
 ```
+
+This keeps execution counts and generated outputs out of the tracked notebook.

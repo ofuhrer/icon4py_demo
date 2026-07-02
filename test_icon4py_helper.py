@@ -187,14 +187,60 @@ def test_check_config_warns_when_basic_timestep_exceeds_coarse_grid_guidance():
         )
 
 
-def test_configure_gt4py_cache_sets_local_persistent_cache(tmp_path):
-    config = quiet_config(gt4py_cache_dir=str(tmp_path / "gt4py-cache"))
+def test_configure_gt4py_cache_sets_local_persistent_cache(tmp_path, monkeypatch):
+    from gt4py.next.otf.compilation import cache as gt4py_cache
+
+    monkeypatch.setenv("TMPDIR", "/existing-tmpdir")
+    monkeypatch.setenv("TEMP", "/existing-temp")
+    monkeypatch.setenv("TMP", "/existing-tmp")
+    config = quiet_config(
+        gt4py_cache_dir=str(tmp_path / ".gt4py_cache"),
+        gt4py_cache_lifetime="persistent",
+    )
 
     cache_root = helper.configure_gt4py_cache(config)
 
-    assert cache_root == tmp_path / "gt4py-cache"
+    assert cache_root == tmp_path / ".gt4py_cache"
     assert cache_root == helper.gt4py_config.BUILD_CACHE_DIR
+    assert (
+        helper.gt4py_config.BUILD_CACHE_LIFETIME
+        is helper.gt4py_config.BuildCacheLifetime.PERSISTENT
+    )
+    assert gt4py_cache.get_cache_base_path(helper.gt4py_config.BUILD_CACHE_LIFETIME) == cache_root
     assert helper.os.environ["GT4PY_BUILD_CACHE_DIR"] == str(tmp_path)
+    assert helper.os.environ["GT4PY_BUILD_CACHE_LIFETIME"] == "persistent"
+    assert helper.os.environ["TMPDIR"] == "/existing-tmpdir"
+    assert helper.os.environ["TEMP"] == "/existing-temp"
+    assert helper.os.environ["TMP"] == "/existing-tmp"
+
+
+def test_integrate_driver_one_step_uses_public_driver_method_and_restores_monitor():
+    class FakeModelTimeVariables:
+        n_time_steps = 12
+
+    class FakeDriver:
+        def __init__(self):
+            self.model_time_variables = FakeModelTimeVariables()
+            self.io_monitor = object()
+            self.calls = []
+
+        def time_integration(self, driver_states_value, do_prep_adv):
+            assert self.model_time_variables.n_time_steps == 1
+            assert self.io_monitor is None
+            self.calls.append((driver_states_value, do_prep_adv))
+
+        def _integrate_one_time_step(self, **kwargs):
+            raise AssertionError("private timestep API must not be called")
+
+    driver = FakeDriver()
+    original_monitor = driver.io_monitor
+    driver_states_value = object()
+
+    helper.integrate_driver_one_step(driver, driver_states_value)
+
+    assert driver.calls == [(driver_states_value, False)]
+    assert driver.model_time_variables.n_time_steps == 12
+    assert driver.io_monitor is original_monitor
 
 
 def test_xarray_snapshot_store_retains_configured_output_frequency():

@@ -8,9 +8,9 @@ import json
 import os
 import pathlib
 import re
-import tempfile
 import warnings
 from dataclasses import dataclass
+from typing import Any
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
@@ -45,7 +45,6 @@ from icon4py.model.common.states import (
 )
 from icon4py.model.common.topography import config as topo_config
 from icon4py.model.common.topography.analytical import jablonowski_williamson as topo_jw
-from icon4py.model.common.utils import device_utils
 from icon4py.model.standalone_driver import (
     config as driver_config,
     driver_io,
@@ -64,6 +63,31 @@ from icon4py.model.standalone_driver.initial_condition.analytical import (
 class GridDescription:
     name: str
     filename: str
+
+
+@dataclass(frozen=True)
+class GridRuntime:
+    backend: Any
+    allocator: Any
+    process_props: Any
+    vertical_grid_config: Any
+    manager: Any
+    icon_grid: Any
+
+
+@dataclass
+class StateRuntime:
+    icon_config: Any
+    decomposition_info: Any
+    exchange: Any
+    global_reductions: Any
+    vertical_grid: Any
+    static_field_factories: Any
+    prognostic_state_now: Any
+    snapshots: Any
+    diagnostics_computer: Any = None
+    driver: Any = None
+    driver_states: Any = None
 
 
 GRID_FILES = {
@@ -281,6 +305,8 @@ def configure_gt4py_cache(config):
     cache_root = pathlib.Path(config["gt4py_cache_dir"]).expanduser().resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    # GT4Py reads these environment variables at import time, then uses the
+    # mutable gt4py.next.config values at compile/cache lookup time.
     os.environ["GT4PY_BUILD_CACHE_DIR"] = str(cache_root.parent)
     os.environ["GT4PY_BUILD_CACHE_LIFETIME"] = config["gt4py_cache_lifetime"]
     gt4py_config.BUILD_CACHE_DIR = cache_root
@@ -288,19 +314,20 @@ def configure_gt4py_cache(config):
         config["gt4py_cache_lifetime"].upper()
     ]
 
-    session_tmp = cache_root / "tmp"
-    session_tmp.mkdir(exist_ok=True)
-    for env_name in ("TMPDIR", "TEMP", "TMP"):
-        os.environ[env_name] = str(session_tmp)
-    tempfile.tempdir = str(session_tmp)
-
     log(
         config,
         f"[cache] GT4Py build cache: {gt4py_config.BUILD_CACHE_DIR} "
         f"({config['gt4py_cache_lifetime']})",
         level="info",
     )
-    log(config, f"[cache] GT4Py session temp root: {session_tmp}", level="debug")
+    if gt4py_config.BUILD_CACHE_LIFETIME is not gt4py_config.BuildCacheLifetime.PERSISTENT:
+        log(
+            config,
+            "[cache] GT4Py session caches use Python's temporary directory; "
+            "set gt4py_cache_lifetime='persistent' to force generated-code artifacts into "
+            "gt4py_cache_dir.",
+            level="warning",
+        )
     return cache_root
 
 
@@ -559,6 +586,14 @@ def create_grid(config):
         "vertical_layer_thickness": vertical["layer_thickness"].values,
         "backend": config["backend"],
         "_config": dict(config),
+        "_runtime": GridRuntime(
+            backend=backend,
+            allocator=allocator,
+            process_props=process_props,
+            vertical_grid_config=vertical_grid_config,
+            manager=grid_manager,
+            icon_grid=grid_manager.grid,
+        ),
         "_backend": backend,
         "_allocator": allocator,
         "_process_props": process_props,
@@ -681,31 +716,32 @@ def update_public_state_fields(state, driver_states_value):
 def initialize_static_context(grid, icon_config, config):
     """Build static fields needed by the analytical state initializer."""
     log(config, "[init] creating exchange/reduction runtimes")
-    decomposition_info = grid["_manager"].decomposition_info
-    exchange = decomp_defs.create_exchange(grid["_process_props"], decomposition_info)
-    global_reductions = decomp_defs.create_reduction(grid["_process_props"], decomposition_info)
+    runtime = grid["_runtime"]
+    decomposition_info = runtime.manager.decomposition_info
+    exchange = decomp_defs.create_exchange(runtime.process_props, decomposition_info)
+    global_reductions = decomp_defs.create_reduction(runtime.process_props, decomposition_info)
 
     log(config, "[init] creating vertical grid, topography, metrics, and interpolation fields")
     vertical_grid = driver_utils.create_vertical_grid(
         vertical_grid_config=icon_config.vertical_grid,
-        allocator=grid["_allocator"],
+        allocator=runtime.allocator,
     )
     cell_topography = topography.create(
         config=icon_config.topography,
-        grid_manager=grid["_manager"],
-        backend=grid["_backend"],
+        grid_manager=runtime.manager,
+        backend=runtime.backend,
         exchange=exchange,
     )
     static_field_factories = driver_utils.create_static_field_factories(
-        grid_manager=grid["_manager"],
+        grid_manager=runtime.manager,
         decomposition_info=decomposition_info,
         vertical_grid=vertical_grid,
         cell_topography=gtx.as_field(
             (dims.CellDim,),
             data=cell_topography,
-            allocator=grid["_allocator"],
+            allocator=runtime.allocator,
         ),
-        backend=grid["_backend"],
+        backend=runtime.backend,
         exchange=exchange,
         global_reductions=global_reductions,
         interpolation_config=icon_config.interpolation,
@@ -722,22 +758,23 @@ def initialize_static_context(grid, icon_config, config):
 
 def build_xarray_snapshot(state, prognostic_state, simulation_datetime):
     """Build prognostic fields plus derived diagnostics as one xarray snapshot."""
-    static_fields = state["_static_field_factories"]
-    diagnostics_computer = state.setdefault(
-        "_diagnostics_computer",
-        driver_io.DiagnosticsComputer(
-            grid=state["_grid"]["_icon_grid"], backend=state["_grid"]["_backend"]
-        ),
-    )
+    runtime = state["_runtime"]
+    static_fields = runtime.static_field_factories
+    if runtime.diagnostics_computer is None:
+        grid_runtime = state["_grid"]["_runtime"]
+        runtime.diagnostics_computer = driver_io.DiagnosticsComputer(
+            grid=grid_runtime.icon_grid, backend=grid_runtime.backend
+        )
+        state["_diagnostics_computer"] = runtime.diagnostics_computer
     output_state = driver_io.prognostic_state_to_dataarrays(prognostic_state)
-    diagnostic_fields = diagnostics_computer.compute(
+    diagnostic_fields = runtime.diagnostics_computer.compute(
         prognostic_state,
         ddqz_z_full=static_fields.metrics.get(metrics_attr.DDQZ_Z_FULL),
         rbf_vec_coeff_c1=static_fields.interpolation.get(intp_attr.RBF_VEC_COEFF_C1),
         rbf_vec_coeff_c2=static_fields.interpolation.get(intp_attr.RBF_VEC_COEFF_C2),
     )
     output_state.update(driver_io.diagnostic_fields_to_dataarrays(diagnostic_fields))
-    return state["_snapshots"].prepare_snapshot(
+    return runtime.snapshots.prepare_snapshot(
         output_state,
         simulation_datetime,
         step_count=state["step_count"],
@@ -838,6 +875,7 @@ def init_state(grid, state, testcase="JW26", config=None):
 
     log(config, f"[init] building ICON4Py config for {testcase}")
     icon_config = build_icon4py_config(state, testcase, config)
+    grid_runtime = grid["_runtime"]
 
     log(config, "[init] preparing static grid context for analytical JW state")
     log(
@@ -851,8 +889,8 @@ def init_state(grid, state, testcase="JW26", config=None):
 
     log(config, "[init] allocating prognostic fields: rho, theta_v, exner, vn, w")
     prognostic_state_now = prognostics.initialize_prognostic_state(
-        grid=grid["_icon_grid"],
-        allocator=grid["_allocator"],
+        grid=grid_runtime.icon_grid,
+        allocator=grid_runtime.allocator,
         tracer_config=icon_config.tracer_config,
     )
 
@@ -860,16 +898,27 @@ def init_state(grid, state, testcase="JW26", config=None):
     initial_condition.create(
         config=icon_config.initial_condition,
         vertical_config=icon_config.vertical_grid,
-        grid=grid["_icon_grid"],
+        grid=grid_runtime.icon_grid,
         static_fields=static_context["static_field_factories"],
         prognostic_state_now=prognostic_state_now,
-        backend=grid["_backend"],
+        backend=grid_runtime.backend,
         exchange=static_context["exchange"],
     )
 
+    state_runtime = StateRuntime(
+        icon_config=icon_config,
+        decomposition_info=static_context["decomposition_info"],
+        exchange=static_context["exchange"],
+        global_reductions=static_context["global_reductions"],
+        vertical_grid=static_context["vertical_grid"],
+        static_field_factories=static_context["static_field_factories"],
+        prognostic_state_now=prognostic_state_now,
+        snapshots=snapshots,
+    )
     state["testcase"] = testcase
     state["step_count"] = 0
     state["_config"] = dict(config)
+    state["_runtime"] = state_runtime
     state["_icon4py_config"] = icon_config
     state["_decomposition_info"] = static_context["decomposition_info"]
     state["_exchange"] = static_context["exchange"]
@@ -891,6 +940,23 @@ def init_state(grid, state, testcase="JW26", config=None):
     )
 
 
+def integrate_driver_one_step(driver, driver_states_value):
+    """Advance ICON4Py through its public integration hook for one timestep."""
+    if not hasattr(driver, "time_integration"):
+        raise RuntimeError("The installed ICON4Py driver does not expose time_integration().")
+
+    model_time_variables = driver.model_time_variables
+    original_n_time_steps = model_time_variables.n_time_steps
+    original_io_monitor = getattr(driver, "io_monitor", None)
+    model_time_variables.n_time_steps = 1
+    driver.io_monitor = None
+    try:
+        driver.time_integration(driver_states_value, do_prep_adv=False)
+    finally:
+        model_time_variables.n_time_steps = original_n_time_steps
+        driver.io_monitor = original_io_monitor
+
+
 @dataclass
 class IconDycoreModel:
     grid: dict
@@ -905,7 +971,6 @@ class IconDycoreModel:
         if not isinstance(count, int) or count < 1:
             raise ValueError("Argument 'count' must be a positive integer timestep count.")
 
-        ds = state["_driver_states"]
         driver = self.driver
         log(
             self.config,
@@ -918,30 +983,19 @@ class IconDycoreModel:
             level="debug",
         )
 
+        runtime = state["_runtime"]
+        if runtime.driver_states is None:
+            raise ValueError("State has no assembled driver states; call 'create_model' first.")
+        ds = runtime.driver_states
         for _ in progress_bar(
             range(1, count + 1),
             self.config,
             total=count,
             description=f"{grid['kind']} dycore + diffusion",
         ):
-            driver.model_time_variables.advance_simulation_datetime()
-            driver._integrate_one_time_step(
-                diffusion_diagnostic_state=ds.diffusion_diagnostic,
-                solve_nonhydro_diagnostic_state=ds.solve_nonhydro_diagnostic,
-                tracer_advection_diagnostic_state=ds.tracer_advection_diagnostic,
-                prognostic_states=ds.prognostics,
-                prep_adv=ds.prep_advection_prognostic,
-                do_prep_adv=False,
-                tracer_prep_adv=ds.prep_tracer_advection_prognostic,
-            )
-            device_utils.sync(grid["_backend"])
-            driver.model_time_variables.is_first_step_in_simulation = False
-
-            if driver.config.nonhydrostatic is not None:
-                driver._adjust_ndyn_substeps_var(ds.solve_nonhydro_diagnostic)
-
+            integrate_driver_one_step(driver, ds)
             state["step_count"] += 1
-            keep_snapshot = state["_snapshots"].should_store_step(state["step_count"])
+            keep_snapshot = runtime.snapshots.should_store_step(state["step_count"])
             store_xarray_snapshot(
                 state,
                 ds.prognostics.current,
@@ -964,37 +1018,39 @@ def create_model(grid, state, config=None):
     config = state["_config"] if config is None else check_config(config)
     require_matching_backend(state, config)
     require_matching_grid(grid, state)
-    if "_prognostic_state_now" not in state:
+    if "_runtime" not in state:
         raise ValueError("State has not been initialized yet; call 'init_state' first.")
 
-    icon_config = state["_icon4py_config"]
+    grid_runtime = grid["_runtime"]
+    runtime = state["_runtime"]
+    icon_config = runtime.icon_config
     log(config, "[model] initializing dycore/diffusion granules")
     granules = driver_utils.initialize_granules(
         config=icon_config,
-        grid=grid["_icon_grid"],
-        vertical_grid=state["_vertical_grid"],
-        static_field_factories=state["_static_field_factories"],
-        exchange=state["_exchange"],
+        grid=grid_runtime.icon_grid,
+        vertical_grid=runtime.vertical_grid,
+        static_field_factories=runtime.static_field_factories,
+        exchange=runtime.exchange,
         owner_mask=gtx.as_field(
             (dims.CellDim,),
-            state["_decomposition_info"].owner_mask(dims.CellDim),
-            allocator=grid["_allocator"],
+            runtime.decomposition_info.owner_mask(dims.CellDim),
+            allocator=grid_runtime.allocator,
         ),
-        backend=grid["_backend"],
+        backend=grid_runtime.backend,
     )
 
     log(config, "[model] assembling time-step state for dycore/diffusion")
     diagnostic_state = diagnostics.initialize_diagnostic_state(
-        grid=grid["_icon_grid"],
-        allocator=grid["_allocator"],
+        grid=grid_runtime.icon_grid,
+        allocator=grid_runtime.allocator,
     )
     driver_states_value = driver_states.assemble_driver_states(
-        grid=grid["_icon_grid"],
-        allocator=grid["_allocator"],
-        backend=grid["_backend"],
-        exchange=state["_exchange"],
-        static_fields=state["_static_field_factories"],
-        prognostic_state_now=state["_prognostic_state_now"],
+        grid=grid_runtime.icon_grid,
+        allocator=grid_runtime.allocator,
+        backend=grid_runtime.backend,
+        exchange=runtime.exchange,
+        static_fields=runtime.static_field_factories,
+        prognostic_state_now=runtime.prognostic_state_now,
         diagnostic_state=diagnostic_state,
         experiment_config=icon_config,
     )
@@ -1006,17 +1062,19 @@ def create_model(grid, state, config=None):
 
     icon_driver = standalone_driver.Icon4pyDriver(
         config=icon_config,
-        backend=grid["_backend"],
-        grid=grid["_icon_grid"],
-        decomposition_info=state["_decomposition_info"],
-        static_field_factories=state["_static_field_factories"],
+        backend=grid_runtime.backend,
+        grid=grid_runtime.icon_grid,
+        decomposition_info=runtime.decomposition_info,
+        static_field_factories=runtime.static_field_factories,
         granules=granules,
         vertical_grid_config=icon_config.vertical_grid,
-        exchange=state["_exchange"],
-        global_reductions=state["_global_reductions"],
-        io_monitor=state["_snapshots"],
+        exchange=runtime.exchange,
+        global_reductions=runtime.global_reductions,
+        io_monitor=None,
     )
 
+    runtime.driver = icon_driver
+    runtime.driver_states = driver_states_value
     state["_driver"] = icon_driver
     state["_driver_states"] = driver_states_value
     update_public_state_fields(state, driver_states_value)
@@ -1440,6 +1498,8 @@ def plot_diagnostics(diagnostics_series, fields=None, stats=("min", "mean", "max
 
 __all__ = [
     "DisplayablePlotlyFigure",
+    "GridRuntime",
+    "StateRuntime",
     "cell_centered_fields",
     "check_config",
     "clip_polygon_longitude",
@@ -1451,6 +1511,7 @@ __all__ = [
     "effective_mesh_size_km",
     "gridline_sphere_coordinates",
     "init_state",
+    "integrate_driver_one_step",
     "load_plotly_graph_objects",
     "lonlat_to_unit_sphere",
     "normalize_config",
