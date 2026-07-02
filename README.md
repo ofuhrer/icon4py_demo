@@ -1,6 +1,6 @@
 # ICON in Python Demo
 
-This directory contains a local notebook domenstrating ICON in Python.
+This directory contains a local notebook demonstrating ICON in Python.
 
 ## Setup
 
@@ -38,8 +38,8 @@ jupyter lab \
   --PasswordIdentityProvider.hashed_password=''
 ```
 
-Then open `http://127.0.0.1:8888/lab` in your preferred browser and open the open the `icon4py_demo.ipynb` notebook.
-kernel if needed.
+Then open `http://127.0.0.1:8888/lab` in your preferred browser and open the
+`icon4py_demo.ipynb` notebook. Select the `ICON4Py demo` kernel if needed.
 
 ### Testing
 
