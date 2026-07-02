@@ -1,0 +1,22 @@
+icon4py @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96
+icon4py-common @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/common
+icon4py-atmosphere-advection @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/atmosphere/advection
+icon4py-atmosphere-diffusion @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/atmosphere/diffusion
+icon4py-atmosphere-dycore @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/atmosphere/dycore
+icon4py-atmosphere-microphysics @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/atmosphere/subgrid_scale_physics/microphysics
+icon4py-atmosphere-muphys @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/atmosphere/subgrid_scale_physics/muphys
+icon4py-driver @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/driver
+icon4py-standalone_driver @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/standalone_driver
+icon4py-testing @ git+https://github.com/C2SM/icon4py.git@5263affcae904c585b07aa37b9507863b01a7a96#subdirectory=model/testing
+gt4py==1.1.11
+jupyterlab
+ipykernel
+nbconvert
+nbformat
+matplotlib
+netCDF4
+plotly
+tqdm
+xarray
+pytest
+ruff
