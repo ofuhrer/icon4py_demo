@@ -1,7 +1,5 @@
 # ICON in Python Demo
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ofuhrer/icon4py_demo/blob/main/icon4py_demo.ipynb)
-
 This directory contains a local notebook domenstrating ICON in Python.
 
 ## Setup
