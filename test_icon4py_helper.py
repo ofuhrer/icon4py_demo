@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import pathlib
 import sys
 
@@ -71,18 +72,14 @@ def synthetic_grid_and_state():
         },
         coords={"time": np.arange(2), "full_level": np.arange(3), "cell": np.arange(4)},
     )
-    snapshots = [dataset.isel(time=index, drop=True) for index in range(dataset.sizes["time"])]
+    instants = [dataset.isel(time=index, drop=True) for index in range(dataset.sizes["time"])]
     state = {
-        "grid_name": "synthetic",
-        "step_count": 0,
-        "xarray": snapshots[-1],
-        "temperature": snapshots[-1]["temperature"],
-        "rho": snapshots[-1]["rho"],
-        "vn": snapshots[-1]["vn"],
-        "pressure": snapshots[-1]["pressure"],
-        "surface_pressure": snapshots[-1]["surface_pressure"],
-        "_grid": grid,
-        "_config": quiet_config(),
+        "xarray": instants[-1],
+        "temperature": instants[-1]["temperature"],
+        "rho": instants[-1]["rho"],
+        "vn": instants[-1]["vn"],
+        "pressure": instants[-1]["pressure"],
+        "surface_pressure": instants[-1]["surface_pressure"],
     }
     return grid, state
 
@@ -95,7 +92,6 @@ def test_check_config_normalizes_defaults_and_rejects_invalid_values():
     assert config["gt4py_cache_dir"].endswith(".gt4py_cache")
     assert "suppress_expected_warnings" not in config
     assert config["suppress_warnings"] is True
-    assert config["output_frequency_steps"] == 1
     assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(157.8125)
 
     with pytest.raises(ValueError, match="Invalid backend"):
@@ -214,7 +210,7 @@ def test_configure_gt4py_cache_sets_local_persistent_cache(tmp_path, monkeypatch
     assert helper.os.environ["TMP"] == "/existing-tmp"
 
 
-def test_integrate_driver_one_step_uses_public_driver_method_and_restores_monitor():
+def test_integrate_driver_steps_uses_public_driver_method_and_restores_monitor():
     class FakeModelTimeVariables:
         n_time_steps = 12
 
@@ -225,7 +221,7 @@ def test_integrate_driver_one_step_uses_public_driver_method_and_restores_monito
             self.calls = []
 
         def time_integration(self, driver_states_value, do_prep_adv):
-            assert self.model_time_variables.n_time_steps == 1
+            assert self.model_time_variables.n_time_steps == 7
             assert self.io_monitor is None
             self.calls.append((driver_states_value, do_prep_adv))
 
@@ -236,20 +232,29 @@ def test_integrate_driver_one_step_uses_public_driver_method_and_restores_monito
     original_monitor = driver.io_monitor
     driver_states_value = object()
 
-    helper.integrate_driver_one_step(driver, driver_states_value)
+    helper.integrate_driver_steps(driver, driver_states_value, 7)
 
     assert driver.calls == [(driver_states_value, False)]
     assert driver.model_time_variables.n_time_steps == 12
     assert driver.io_monitor is original_monitor
 
 
-def test_xarray_snapshot_store_retains_configured_output_frequency():
-    store = helper.XarraySnapshotStore(output_frequency_steps=2)
+def test_prepare_current_xarray_state_adds_time_and_step_metadata():
+    current = helper.prepare_current_xarray_state(
+        {"rho": xr.DataArray(np.array([1.0, 2.0]), dims=("cell",))},
+        dt.datetime(2000, 1, 1, 0, 2, tzinfo=dt.timezone.utc),
+        step_count=3,
+    )
 
-    assert store.should_store_step(0)
-    assert not store.should_store_step(1)
-    assert store.should_store_step(2)
-    assert not store.should_store_step(3)
+    assert list(current.data_vars) == ["rho"]
+    assert current.attrs["step_count"] == 3
+    assert current.coords["time"].values == np.datetime64("2000-01-01T00:02:00")
+
+
+def test_format_datetime64_returns_scalar_timestamp():
+    assert helper.format_datetime64(np.datetime64("2000-01-02T00:00:00.000000")) == (
+        "2000-01-02T00:00:00"
+    )
 
 
 def test_create_state_keeps_backend_and_tracer_metadata():
@@ -258,23 +263,23 @@ def test_create_state_keeps_backend_and_tracer_metadata():
 
     state = helper.create_state(grid, config, tracers={"qv": None})
 
-    assert state["grid_name"] == "synthetic"
     assert state["tracers"] == {"qv": None}
-    assert state["step_count"] == 0
     assert state["xarray"] is None
+    assert "_grid" not in state
+    assert "_config" not in state
 
 
 def test_build_icon4py_config_uses_positive_internal_timesteps():
     config = quiet_config()
+    grid = {
+        "kind": "R02B04",
+        "_vertical_grid_config": helper.v_grid.VerticalGridConfig(num_levels=config["levels"]),
+    }
     state = {
         "tracers": {},
-        "_grid": {
-            "kind": "R02B04",
-            "_vertical_grid_config": helper.v_grid.VerticalGridConfig(num_levels=config["levels"]),
-        },
     }
 
-    icon_config = helper.build_icon4py_config(state, "JW26", config)
+    icon_config = helper.build_icon4py_config(grid, state, "JW26", config)
     time_variables = helper.driver_states.ModelTimeVariables(config=icon_config.driver)
 
     assert time_variables.n_time_steps == 1
@@ -390,6 +395,20 @@ def test_plot_field_rejects_unknown_projection():
 
     with pytest.raises(ValueError, match="projection"):
         helper.plot_field(grid, state, "temperature", projection="not-a-projection")
+
+
+def test_plot_field_rejects_out_of_range_vertical_level():
+    grid, state = synthetic_grid_and_state()
+
+    with pytest.raises(ValueError, match="between 0 and 2"):
+        helper.plot_field(grid, state, "temperature", level=99)
+
+
+def test_plot_field_rejects_level_for_field_without_vertical_dimension():
+    grid, state = synthetic_grid_and_state()
+
+    with pytest.raises(ValueError, match="no vertical dimension"):
+        helper.plot_field(grid, state, "surface_pressure", level=1)
 
 
 def test_plot_field_rejects_field_argument_for_grid_only_plot():

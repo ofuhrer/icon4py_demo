@@ -77,6 +77,7 @@ class GridRuntime:
 
 @dataclass
 class StateRuntime:
+    grid: dict
     icon_config: Any
     decomposition_info: Any
     exchange: Any
@@ -84,10 +85,10 @@ class StateRuntime:
     vertical_grid: Any
     static_field_factories: Any
     prognostic_state_now: Any
-    snapshots: Any
     diagnostics_computer: Any = None
     driver: Any = None
     driver_states: Any = None
+    step_count: int = 0
 
 
 GRID_FILES = {
@@ -105,7 +106,6 @@ DEFAULT_CONFIG = {
     "levels": 10,
     "dtime_seconds": 120,
     "ndyn_substeps": 5,
-    "output_frequency_steps": 1,
     "baroclinic_amplitude": 1.0,
     "log_level": "info",
     "gt4py_cache_dir": str(PROJECT_ROOT / ".gt4py_cache"),
@@ -233,11 +233,6 @@ def check_config(config=None):
         raise ValueError("Config value 'dtime_seconds' must be positive.")
     if not isinstance(merged["ndyn_substeps"], int) or merged["ndyn_substeps"] < 1:
         raise ValueError("Config value 'ndyn_substeps' must be a positive integer.")
-    if (
-        not isinstance(merged["output_frequency_steps"], int)
-        or merged["output_frequency_steps"] < 1
-    ):
-        raise ValueError("Config value 'output_frequency_steps' must be a positive integer.")
     if float(merged["baroclinic_amplitude"]) < 0:
         raise ValueError("Config value 'baroclinic_amplitude' must be non-negative.")
     cache_lifetime = str(merged["gt4py_cache_lifetime"]).lower()
@@ -268,35 +263,21 @@ def is_log_enabled(config, level):
     return LOG_LEVELS[config["log_level"]] >= LOG_LEVELS[level]
 
 
-def progress_bar(iterable, config, *, total, description):
-    """Return a tqdm progress bar when available and logging is enabled."""
-    if not is_log_enabled(config, "info"):
-        return iterable
-    try:
-        tqdm_auto = importlib.import_module("tqdm.auto")
-    except ImportError:
-        return iterable
-    return tqdm_auto.tqdm(iterable, total=total, desc=description, unit="step")
-
-
-def require_matching_backend(state, config):
+def require_matching_backend(grid, config):
     config = check_config(config)
-    state_backend = state["_config"]["backend"]
-    if config["backend"] != state_backend:
+    if config["backend"] != grid["backend"]:
         raise ValueError(
-            f"state was created with backend {state_backend!r}, "
+            f"grid was created with backend {grid['backend']!r}, "
             f"but config requests {config['backend']!r}"
         )
 
 
 def require_matching_grid(grid, state):
-    if state.get("_grid") is not grid:
+    ds = state.get("xarray")
+    if ds is None or "cell" not in ds.sizes:
+        return
+    if ds.sizes["cell"] != len(grid["lon"]):
         raise ValueError("The state was not created from the supplied grid.")
-    if grid["backend"] != state["_config"]["backend"]:
-        raise ValueError(
-            f"Grid backend {grid['backend']!r} does not match state backend "
-            f"{state['_config']['backend']!r}."
-        )
 
 
 def configure_gt4py_cache(config):
@@ -639,74 +620,36 @@ def create_state(grid, config, tracers=None):
         config, f"[state] creating empty state for {grid['kind']} with tracers={list(tracer_names)}"
     )
     return {
-        "grid_name": grid["name"],
         "tracers": tracer_names,
-        "step_count": 0,
         "rho": None,
         "theta_v": None,
         "exner": None,
         "vn": None,
         "w": None,
         "xarray": None,
-        "_grid": grid,
-        "_config": dict(config),
     }
 
 
-class XarraySnapshotStore:
-    def __init__(self, output_frequency_steps=1):
-        if not isinstance(output_frequency_steps, int) or output_frequency_steps < 1:
-            raise ValueError("Argument 'output_frequency_steps' must be a positive integer.")
-        self.output_frequency_steps = output_frequency_steps
-        self.snapshots = []
-        self.seen_steps = 0
-
-    def should_store_step(self, step_count):
-        return step_count == 0 or step_count % self.output_frequency_steps == 0
-
-    def prepare_snapshot(self, state, simulation_datetime, step_count=None):
-        timestamp = np.datetime64(
-            simulation_datetime.astimezone(dt.timezone.utc).replace(tzinfo=None)
-        )
-        snapshot = xr.Dataset({name: array.copy(deep=True) for name, array in state.items()})
-        snapshot = snapshot.assign_coords(time=timestamp)
-        if step_count is not None:
-            snapshot = snapshot.assign_attrs(step_count=int(step_count))
-        return snapshot
-
-    def store_snapshot(self, snapshot):
-        self.snapshots.append(snapshot)
-        return snapshot
-
-    def store(self, state, simulation_datetime):
-        self.seen_steps += 1
-        snapshot = self.prepare_snapshot(
-            state,
-            simulation_datetime,
-            step_count=self.seen_steps,
-        )
-        if self.should_store_step(self.seen_steps):
-            self.store_snapshot(snapshot)
-
-    def close(self):
-        pass
-
-    @property
-    def dataset(self):
-        if not self.snapshots:
-            raise RuntimeError("No xarray snapshots have been collected.")
-        return xr.concat([snapshot.expand_dims("time") for snapshot in self.snapshots], dim="time")
+def prepare_current_xarray_state(fields, simulation_datetime, step_count=None):
+    timestamp = np.datetime64(
+        simulation_datetime.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    )
+    current = xr.Dataset({name: array.copy(deep=True) for name, array in fields.items()})
+    current = current.assign_coords(time=timestamp)
+    if step_count is not None:
+        current = current.assign_attrs(step_count=int(step_count))
+    return current
 
 
-def update_public_xarray_fields(state, snapshot):
-    """Expose the latest xarray snapshot through the student-facing state dictionary."""
-    state["xarray"] = snapshot
-    for field_name, values in snapshot.data_vars.items():
+def update_public_xarray_fields(state, current):
+    """Expose the latest xarray state through the student-facing state dictionary."""
+    state["xarray"] = current
+    for field_name, values in current.data_vars.items():
         state[field_name] = values
 
 
 def update_public_prognostic_fields(state, prognostic):
-    state["_prognostic_state_now"] = prognostic
+    state["_runtime"].prognostic_state_now = prognostic
 
 
 def update_public_state_fields(state, driver_states_value):
@@ -756,16 +699,15 @@ def initialize_static_context(grid, icon_config, config):
     }
 
 
-def build_xarray_snapshot(state, prognostic_state, simulation_datetime):
-    """Build prognostic fields plus derived diagnostics as one xarray snapshot."""
+def build_xarray_state(state, prognostic_state, simulation_datetime):
+    """Build current prognostic fields plus derived diagnostics as one xarray dataset."""
     runtime = state["_runtime"]
     static_fields = runtime.static_field_factories
     if runtime.diagnostics_computer is None:
-        grid_runtime = state["_grid"]["_runtime"]
+        grid_runtime = runtime.grid["_runtime"]
         runtime.diagnostics_computer = driver_io.DiagnosticsComputer(
             grid=grid_runtime.icon_grid, backend=grid_runtime.backend
         )
-        state["_diagnostics_computer"] = runtime.diagnostics_computer
     output_state = driver_io.prognostic_state_to_dataarrays(prognostic_state)
     diagnostic_fields = runtime.diagnostics_computer.compute(
         prognostic_state,
@@ -774,20 +716,23 @@ def build_xarray_snapshot(state, prognostic_state, simulation_datetime):
         rbf_vec_coeff_c2=static_fields.interpolation.get(intp_attr.RBF_VEC_COEFF_C2),
     )
     output_state.update(driver_io.diagnostic_fields_to_dataarrays(diagnostic_fields))
-    return runtime.snapshots.prepare_snapshot(
+    return prepare_current_xarray_state(
         output_state,
         simulation_datetime,
-        step_count=state["step_count"],
+        step_count=runtime.step_count,
     )
 
 
-def store_xarray_snapshot(state, prognostic_state, simulation_datetime, *, keep=True):
-    """Update the current xarray state and optionally retain it in output history."""
-    snapshot = build_xarray_snapshot(state, prognostic_state, simulation_datetime)
-    if keep:
-        state["_snapshots"].store_snapshot(snapshot)
-    update_public_xarray_fields(state, snapshot)
-    return snapshot
+def update_xarray_state(state, prognostic_state, simulation_datetime):
+    """Update the current xarray view of the atmospheric state."""
+    current = build_xarray_state(state, prognostic_state, simulation_datetime)
+    update_public_xarray_fields(state, current)
+    return current
+
+
+def format_datetime64(value):
+    """Return a compact scalar datetime string for notebook progress output."""
+    return np.datetime_as_string(np.datetime64(value), unit="s")
 
 
 def state_field_diagnostics(state, time=None):
@@ -818,9 +763,10 @@ def state_field_diagnostics(state, time=None):
 def append_diagnostics(diagnostics_series, state, label):
     rows = state_field_diagnostics(state)
     time_value = state["xarray"].coords["time"].values if "time" in state["xarray"].coords else None
+    step_count = state["_runtime"].step_count if "_runtime" in state else state["xarray"].attrs.get("step_count")
     diagnostics_series.append(
         {
-            "step": state["step_count"],
+            "step": step_count,
             "label": label,
             "time": time_value,
             "fields": rows,
@@ -829,7 +775,7 @@ def append_diagnostics(diagnostics_series, state, label):
     return rows
 
 
-def build_icon4py_config(state, testcase, config):
+def build_icon4py_config(grid, state, testcase, config):
     config = check_config(config)
     if testcase.upper() not in {"JW26", "JW", "JABLONOWSKI-WILLIAMSON"}:
         raise NotImplementedError(
@@ -841,7 +787,6 @@ def build_icon4py_config(state, testcase, config):
             "Active tracer advection is not wired in this notebook API yet; use tracers=None or {}."
         )
 
-    grid = state["_grid"]
     return driver_config.ExperimentConfig(
         metrics=metrics_factory.MetricsConfig(),
         interpolation=interpolation_factory.InterpolationConfig(),
@@ -869,12 +814,11 @@ def build_icon4py_config(state, testcase, config):
 
 
 def init_state(grid, state, testcase="JW26", config=None):
-    config = state["_config"] if config is None else check_config(config)
-    require_matching_backend(state, config)
-    require_matching_grid(grid, state)
+    config = check_config(config)
+    require_matching_backend(grid, config)
 
     log(config, f"[init] building ICON4Py config for {testcase}")
-    icon_config = build_icon4py_config(state, testcase, config)
+    icon_config = build_icon4py_config(grid, state, testcase, config)
     grid_runtime = grid["_runtime"]
 
     log(config, "[init] preparing static grid context for analytical JW state")
@@ -885,7 +829,6 @@ def init_state(grid, state, testcase="JW26", config=None):
         level="debug",
     )
     static_context = initialize_static_context(grid, icon_config, config)
-    snapshots = XarraySnapshotStore(output_frequency_steps=config["output_frequency_steps"])
 
     log(config, "[init] allocating prognostic fields: rho, theta_v, exner, vn, w")
     prognostic_state_now = prognostics.initialize_prognostic_state(
@@ -906,6 +849,7 @@ def init_state(grid, state, testcase="JW26", config=None):
     )
 
     state_runtime = StateRuntime(
+        grid=grid,
         icon_config=icon_config,
         decomposition_info=static_context["decomposition_info"],
         exchange=static_context["exchange"],
@@ -913,25 +857,12 @@ def init_state(grid, state, testcase="JW26", config=None):
         vertical_grid=static_context["vertical_grid"],
         static_field_factories=static_context["static_field_factories"],
         prognostic_state_now=prognostic_state_now,
-        snapshots=snapshots,
     )
-    state["testcase"] = testcase
-    state["step_count"] = 0
-    state["_config"] = dict(config)
     state["_runtime"] = state_runtime
-    state["_icon4py_config"] = icon_config
-    state["_decomposition_info"] = static_context["decomposition_info"]
-    state["_exchange"] = static_context["exchange"]
-    state["_global_reductions"] = static_context["global_reductions"]
-    state["_vertical_grid"] = static_context["vertical_grid"]
-    state["_static_field_factories"] = static_context["static_field_factories"]
-    state["_prognostic_state_now"] = prognostic_state_now
-    state["_snapshots"] = snapshots
-    store_xarray_snapshot(
+    update_xarray_state(
         state,
         prognostic_state_now,
         icon_config.driver.start_of_simulation,
-        keep=True,
     )
     update_public_prognostic_fields(state, prognostic_state_now)
     log(
@@ -940,15 +871,15 @@ def init_state(grid, state, testcase="JW26", config=None):
     )
 
 
-def integrate_driver_one_step(driver, driver_states_value):
-    """Advance ICON4Py through its public integration hook for one timestep."""
+def integrate_driver_steps(driver, driver_states_value, count):
+    """Advance ICON4Py through its public integration hook for `count` timesteps."""
     if not hasattr(driver, "time_integration"):
         raise RuntimeError("The installed ICON4Py driver does not expose time_integration().")
 
     model_time_variables = driver.model_time_variables
     original_n_time_steps = model_time_variables.n_time_steps
     original_io_monitor = getattr(driver, "io_monitor", None)
-    model_time_variables.n_time_steps = 1
+    model_time_variables.n_time_steps = count
     driver.io_monitor = None
     try:
         driver.time_integration(driver_states_value, do_prep_adv=False)
@@ -965,18 +896,13 @@ class IconDycoreModel:
 
     def step(self, grid, state, count=1, diagnostics=None):
         """Advance the current state by `count` additional timesteps in place."""
-        require_matching_backend(state, self.config)
-        if grid is not self.grid or state["_grid"] is not grid:
+        require_matching_backend(grid, self.config)
+        if grid is not self.grid:
             raise ValueError("The grid passed to 'step' must be the grid used to create the state.")
         if not isinstance(count, int) or count < 1:
             raise ValueError("Argument 'count' must be a positive integer timestep count.")
 
         driver = self.driver
-        log(
-            self.config,
-            f"[step] advancing {count} timestep(s) on {grid['kind']} "
-            f"from step_count={state['step_count']}",
-        )
         log(
             self.config,
             "[step] first call may compile GT4Py dycore/diffusion kernels",
@@ -987,36 +913,29 @@ class IconDycoreModel:
         if runtime.driver_states is None:
             raise ValueError("State has no assembled driver states; call 'create_model' first.")
         ds = runtime.driver_states
-        for _ in progress_bar(
-            range(1, count + 1),
-            self.config,
-            total=count,
-            description=f"{grid['kind']} dycore + diffusion",
-        ):
-            integrate_driver_one_step(driver, ds)
-            state["step_count"] += 1
-            keep_snapshot = runtime.snapshots.should_store_step(state["step_count"])
-            store_xarray_snapshot(
-                state,
-                ds.prognostics.current,
-                driver.model_time_variables.simulation_current_datetime,
-                keep=keep_snapshot,
-            )
-            update_public_state_fields(state, ds)
-            if diagnostics is not None:
-                append_diagnostics(diagnostics, state, f"step {state['step_count']}")
+        integrate_driver_steps(driver, ds, count)
+        runtime.step_count += count
+        update_xarray_state(
+            state,
+            ds.prognostics.current,
+            driver.model_time_variables.simulation_current_datetime,
+        )
+        update_public_state_fields(state, ds)
+        if diagnostics is not None:
+            append_diagnostics(diagnostics, state, f"step {runtime.step_count}")
 
         update_public_state_fields(state, ds)
+        current_time = format_datetime64(state["xarray"].coords["time"].values)
         log(
             self.config,
-            f"[step] complete: step_count={state['step_count']}, "
-            f"current_time={state['xarray'].coords.get('time')}",
+            f"[step] {grid['kind']}: +{count} timesteps, "
+            f"step_count={runtime.step_count}, time={current_time}",
         )
 
 
 def create_model(grid, state, config=None):
-    config = state["_config"] if config is None else check_config(config)
-    require_matching_backend(state, config)
+    config = check_config(config)
+    require_matching_backend(grid, config)
     require_matching_grid(grid, state)
     if "_runtime" not in state:
         raise ValueError("State has not been initialized yet; call 'init_state' first.")
@@ -1024,7 +943,7 @@ def create_model(grid, state, config=None):
     grid_runtime = grid["_runtime"]
     runtime = state["_runtime"]
     icon_config = runtime.icon_config
-    log(config, "[model] initializing dycore/diffusion granules")
+    log(config, "[model] initializing ICON4Py dycore/diffusion")
     granules = driver_utils.initialize_granules(
         config=icon_config,
         grid=grid_runtime.icon_grid,
@@ -1039,7 +958,7 @@ def create_model(grid, state, config=None):
         backend=grid_runtime.backend,
     )
 
-    log(config, "[model] assembling time-step state for dycore/diffusion")
+    log(config, "[model] assembling time-step state", level="debug")
     diagnostic_state = diagnostics.initialize_diagnostic_state(
         grid=grid_runtime.icon_grid,
         allocator=grid_runtime.allocator,
@@ -1075,28 +994,33 @@ def create_model(grid, state, config=None):
 
     runtime.driver = icon_driver
     runtime.driver_states = driver_states_value
-    state["_driver"] = icon_driver
-    state["_driver_states"] = driver_states_value
     update_public_state_fields(state, driver_states_value)
-    log(config, "[model] ready; GT4Py dycore/diffusion kernels compile lazily on first step")
+    log(config, "[model] ready")
     return IconDycoreModel(grid=grid, driver=icon_driver, config=dict(config))
 
 
 def select_vertical_level(arr, grid, level=None):
     """Return one vertical slice and the resolved level index."""
-    if level is None:
-        level = grid["num_levels"] // 2
-
     for vertical_dim in ("full_level", "half_level", "level"):
         if vertical_dim in arr.dims:
-            arr = arr.isel({vertical_dim: min(level, arr.sizes[vertical_dim] - 1)})
-            break
+            resolved_level = grid["num_levels"] // 2 if level is None else level
+            if not isinstance(resolved_level, int):
+                raise ValueError("Argument 'level' must be an integer vertical level index.")
+            if resolved_level < 0 or resolved_level >= arr.sizes[vertical_dim]:
+                raise ValueError(
+                    f"Argument 'level' must be between 0 and {arr.sizes[vertical_dim] - 1} "
+                    f"for {arr.name or 'field'}."
+                )
+            return arr.isel({vertical_dim: resolved_level}), resolved_level
 
     if "cell" not in arr.dims:
         name = arr.name or "field"
         raise ValueError(f"{name!r} is not cell-centered; dims are {arr.dims}.")
 
-    return arr, level
+    if level is not None:
+        raise ValueError(f"{arr.name or 'field'} has no vertical dimension; omit 'level'.")
+
+    return arr, None
 
 
 def select_cell_field(grid, state, field, level=None, time=-1):
@@ -1511,7 +1435,7 @@ __all__ = [
     "effective_mesh_size_km",
     "gridline_sphere_coordinates",
     "init_state",
-    "integrate_driver_one_step",
+    "integrate_driver_steps",
     "load_plotly_graph_objects",
     "lonlat_to_unit_sphere",
     "normalize_config",
