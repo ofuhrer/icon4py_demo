@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import matplotlib
 import numpy as np
@@ -283,6 +284,266 @@ def test_build_icon4py_config_uses_positive_internal_timesteps():
     time_variables = helper.driver_states.ModelTimeVariables(config=icon_config.driver)
 
     assert time_variables.n_time_steps == 1
+
+
+def test_init_state_builds_static_context_without_initializing_driver(monkeypatch):
+    config = quiet_config()
+    icon_grid = object()
+    allocator = object()
+    backend = object()
+    static_fields = object()
+    exchange = object()
+    static_context = {
+        "decomposition_info": object(),
+        "exchange": exchange,
+        "global_reductions": object(),
+        "vertical_grid": object(),
+        "static_field_factories": static_fields,
+    }
+    prognostic_state = object()
+    grid = {
+        "kind": "R02B04",
+        "backend": "embedded",
+        "_vertical_grid_config": helper.v_grid.VerticalGridConfig(num_levels=config["levels"]),
+        "_runtime": SimpleNamespace(
+            backend=backend,
+            allocator=allocator,
+            icon_grid=icon_grid,
+        ),
+    }
+    state = {"tracers": {}}
+    calls = {}
+
+    def fail_initialize_driver(**kwargs):
+        raise AssertionError("init_state must not initialize dycore/diffusion")
+
+    def fake_initialize_static_context(*args):
+        calls["initialize_static_context"] = args
+        return static_context
+
+    def fake_initialize_prognostic_state(**kwargs):
+        calls["initialize_prognostic_state"] = kwargs
+        return prognostic_state
+
+    def fake_initial_condition_create(**kwargs):
+        calls["initial_condition_create"] = kwargs
+
+    def fake_update_xarray_state(state_arg, prognostic_arg, simulation_datetime):
+        calls["update_xarray_state"] = (state_arg, prognostic_arg, simulation_datetime)
+        state_arg["xarray"] = xr.Dataset()
+
+    monkeypatch.setattr(helper.standalone_driver, "initialize_driver", fail_initialize_driver)
+    monkeypatch.setattr(helper, "initialize_static_context", fake_initialize_static_context)
+    monkeypatch.setattr(
+        helper.prognostics, "initialize_prognostic_state", fake_initialize_prognostic_state
+    )
+    monkeypatch.setattr(helper.initial_condition, "create", fake_initial_condition_create)
+    monkeypatch.setattr(helper, "update_xarray_state", fake_update_xarray_state)
+
+    helper.init_state(grid, state, "JW26", config)
+
+    runtime = state["_runtime"]
+    assert calls["initialize_static_context"][0] is grid
+    assert calls["initialize_static_context"][2] == config
+    assert calls["initialize_prognostic_state"] == {
+        "grid": icon_grid,
+        "allocator": allocator,
+        "tracer_config": runtime.icon_config.tracer_config,
+    }
+    assert calls["initial_condition_create"]["grid"] is icon_grid
+    assert calls["initial_condition_create"]["static_fields"] is static_fields
+    assert calls["initial_condition_create"]["backend"] is backend
+    assert calls["initial_condition_create"]["exchange"] is exchange
+    assert runtime.driver is None
+    assert runtime.static_field_factories is static_fields
+
+
+def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeypatch, tmp_path):
+    config = quiet_config()
+    allocator = object()
+    icon_grid = object()
+    diagnostic_state = object()
+    prognostic_state = object()
+    static_fields = object()
+    driver_states_value = SimpleNamespace(
+        prognostics=SimpleNamespace(current=object()),
+    )
+    output_path = tmp_path / "output"
+    icon_config = SimpleNamespace(
+        driver=SimpleNamespace(enable_output=False, output_path=output_path),
+    )
+    icon_driver = SimpleNamespace(
+        config=icon_config,
+        grid=icon_grid,
+        backend=object(),
+        exchange=object(),
+        static_field_factories=static_fields,
+        granules=object(),
+    )
+    grid = {
+        "kind": "R02B04",
+        "backend": "embedded",
+        "_runtime": SimpleNamespace(
+            allocator=allocator,
+            manager=object(),
+            process_props=object(),
+            backend=object(),
+        ),
+    }
+    state = {
+        "xarray": None,
+        "_runtime": helper.StateRuntime(
+            grid=grid,
+            icon_config=icon_config,
+            decomposition_info=object(),
+            exchange=object(),
+            global_reductions=object(),
+            vertical_grid=object(),
+            static_field_factories=object(),
+            prognostic_state_now=prognostic_state,
+        ),
+    }
+    calls = {}
+
+    def fake_initialize_driver(**kwargs):
+        calls["initialize_driver"] = kwargs
+        output_path.mkdir()
+        return icon_driver
+
+    def fake_initialize_diagnostic_state(**kwargs):
+        calls["initialize_diagnostic_state"] = kwargs
+        return diagnostic_state
+
+    def fake_assemble_driver_states(**kwargs):
+        calls["assemble_driver_states"] = kwargs
+        return driver_states_value
+
+    def fake_validate_granule_state_consistency(**kwargs):
+        calls["validate_granule_state_consistency"] = kwargs
+
+    monkeypatch.setattr(helper.standalone_driver, "initialize_driver", fake_initialize_driver)
+    monkeypatch.setattr(
+        helper.diagnostics, "initialize_diagnostic_state", fake_initialize_diagnostic_state
+    )
+    monkeypatch.setattr(
+        helper.driver_states, "assemble_driver_states", fake_assemble_driver_states
+    )
+    monkeypatch.setattr(
+        helper.driver_utils,
+        "validate_granule_state_consistency",
+        fake_validate_granule_state_consistency,
+    )
+
+    model = helper.create_model(grid, state, config)
+
+    assert model.driver is icon_driver
+    assert calls["initialize_driver"] == {
+        "config": icon_config,
+        "grid_manager": grid["_runtime"].manager,
+        "process_props": grid["_runtime"].process_props,
+        "backend": grid["_runtime"].backend,
+    }
+    assert not output_path.exists()
+    assert state["_runtime"].driver_states is driver_states_value
+    assert calls["initialize_diagnostic_state"] == {
+        "grid": icon_grid,
+        "allocator": allocator,
+    }
+    assert calls["assemble_driver_states"]["grid"] is icon_grid
+    assert calls["assemble_driver_states"]["allocator"] is allocator
+    assert calls["assemble_driver_states"]["backend"] is icon_driver.backend
+    assert calls["assemble_driver_states"]["exchange"] is icon_driver.exchange
+    assert calls["assemble_driver_states"]["static_fields"] is static_fields
+    assert calls["assemble_driver_states"]["prognostic_state_now"] is prognostic_state
+    assert calls["assemble_driver_states"]["diagnostic_state"] is diagnostic_state
+    assert calls["validate_granule_state_consistency"]["granules"] is icon_driver.granules
+
+
+def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    config = helper.check_config(
+        {
+            "grid": "R01B01",
+            "backend": "gtfn_cpu",
+            "levels": 10,
+            "dtime_seconds": 120,
+            "ndyn_substeps": 5,
+            "baroclinic_amplitude": 1.0,
+            "log_level": "quiet",
+            "suppress_warnings": True,
+        }
+    )
+    plot_level = config["levels"] // 2
+
+    grid = helper.create_grid(config)
+    assert {key: grid[key] for key in ["kind", "num_levels", "backend"]} == {
+        "kind": "R01B01",
+        "num_levels": 10,
+        "backend": "gtfn_cpu",
+    }
+    assert grid["dims"]["cell"] == len(grid["lon"])
+    assert len(grid["vertical_interfaces"]) == config["levels"] + 1
+
+    grid_figure = helper.plot_field(
+        grid,
+        None,
+        title=f"ICON {config['grid']} grid",
+        projection="sphere",
+    )
+    assert grid_figure.data[0].type == "scatter3d"
+
+    state = helper.create_state(grid, config, tracers=None)
+    assert [key for key in ["rho", "theta_v", "exner", "vn", "w"] if state[key] is not None] == []
+
+    helper.init_state(grid, state, "JW26", config)
+    assert {"cell", "level", "half_level", "edge"} <= set(state["xarray"].sizes)
+    assert state["temperature"].sizes["level"] == config["levels"]
+
+    initial_figure = helper.plot_field(
+        grid,
+        state["temperature"],
+        title=f"Initial Condition (Temperature, level {plot_level})",
+        colorbar_label="K",
+        level=plot_level,
+        projection="sphere",
+    )
+    assert initial_figure.data[0].type == "mesh3d"
+
+    model = helper.create_model(grid, state, config)
+    diagnostics = []
+    daily_states = [state["xarray"].copy(deep=True)]
+    steps_to_run = 1
+
+    for _step in range(1, steps_to_run + 1):
+        model.step(grid, state, count=1, diagnostics=diagnostics)
+        daily_states.append(state["xarray"].copy(deep=True))
+
+    assert len(daily_states) == 2
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["step"] == 1
+    assert not list(tmp_path.glob("output*"))
+
+    final_figure = helper.plot_field(
+        grid,
+        daily_states[-1]["temperature"],
+        title=f"Temperature at t = +{steps_to_run} timestep, level {plot_level}",
+        colorbar_label="K",
+        level=plot_level,
+        projection="sphere",
+    )
+    perturbation_figure = helper.plot_field(
+        grid,
+        daily_states[-1]["temperature"] - daily_states[0]["temperature"],
+        title=f"Temperature perturbation at t = +{steps_to_run} timestep, level {plot_level}",
+        colorbar_label="K",
+        level=plot_level,
+        projection="sphere",
+    )
+    diagnostic_axes = helper.plot_diagnostics(diagnostics, fields=["temperature", "rho", "exner"])
+
+    assert final_figure.data[0].type == "mesh3d"
+    assert perturbation_figure.data[0].type == "mesh3d"
+    assert len(diagnostic_axes) == 3
 
 
 def test_diagnostics_and_plots_work_for_synthetic_xarray():

@@ -888,6 +888,22 @@ def integrate_driver_steps(driver, driver_states_value, count):
         driver.io_monitor = original_io_monitor
 
 
+def remove_disabled_output_directory(icon_driver):
+    """Remove the empty output directory ICON4Py creates even when output is disabled."""
+    driver_config_value = icon_driver.config.driver
+    if driver_config_value.enable_output:
+        return
+
+    output_path = pathlib.Path(driver_config_value.output_path)
+    try:
+        output_path.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Never remove user data if the directory is unexpectedly non-empty.
+        pass
+
+
 @dataclass
 class IconDycoreModel:
     grid: dict
@@ -940,59 +956,43 @@ def create_model(grid, state, config=None):
     if "_runtime" not in state:
         raise ValueError("State has not been initialized yet; call 'init_state' first.")
 
-    grid_runtime = grid["_runtime"]
     runtime = state["_runtime"]
+    icon_driver = runtime.driver
+    if icon_driver is None:
+        log(config, "[model] initializing ICON4Py dycore/diffusion")
+        icon_driver = standalone_driver.initialize_driver(
+            config=runtime.icon_config,
+            grid_manager=grid["_runtime"].manager,
+            process_props=grid["_runtime"].process_props,
+            backend=grid["_runtime"].backend,
+        )
+        remove_disabled_output_directory(icon_driver)
+        runtime.driver = icon_driver
+    runtime.icon_config = icon_driver.config
+    runtime.static_field_factories = icon_driver.static_field_factories
     icon_config = runtime.icon_config
-    log(config, "[model] initializing ICON4Py dycore/diffusion")
-    granules = driver_utils.initialize_granules(
-        config=icon_config,
-        grid=grid_runtime.icon_grid,
-        vertical_grid=runtime.vertical_grid,
-        static_field_factories=runtime.static_field_factories,
-        exchange=runtime.exchange,
-        owner_mask=gtx.as_field(
-            (dims.CellDim,),
-            runtime.decomposition_info.owner_mask(dims.CellDim),
-            allocator=grid_runtime.allocator,
-        ),
-        backend=grid_runtime.backend,
-    )
 
     log(config, "[model] assembling time-step state", level="debug")
     diagnostic_state = diagnostics.initialize_diagnostic_state(
-        grid=grid_runtime.icon_grid,
-        allocator=grid_runtime.allocator,
+        grid=icon_driver.grid,
+        allocator=grid["_runtime"].allocator,
     )
     driver_states_value = driver_states.assemble_driver_states(
-        grid=grid_runtime.icon_grid,
-        allocator=grid_runtime.allocator,
-        backend=grid_runtime.backend,
-        exchange=runtime.exchange,
-        static_fields=runtime.static_field_factories,
+        grid=icon_driver.grid,
+        allocator=grid["_runtime"].allocator,
+        backend=icon_driver.backend,
+        exchange=icon_driver.exchange,
+        static_fields=icon_driver.static_field_factories,
         prognostic_state_now=runtime.prognostic_state_now,
         diagnostic_state=diagnostic_state,
         experiment_config=icon_config,
     )
     driver_utils.validate_granule_state_consistency(
         config=icon_config,
-        granules=granules,
+        granules=icon_driver.granules,
         states=driver_states_value,
     )
 
-    icon_driver = standalone_driver.Icon4pyDriver(
-        config=icon_config,
-        backend=grid_runtime.backend,
-        grid=grid_runtime.icon_grid,
-        decomposition_info=runtime.decomposition_info,
-        static_field_factories=runtime.static_field_factories,
-        granules=granules,
-        vertical_grid_config=icon_config.vertical_grid,
-        exchange=runtime.exchange,
-        global_reductions=runtime.global_reductions,
-        io_monitor=None,
-    )
-
-    runtime.driver = icon_driver
     runtime.driver_states = driver_states_value
     update_public_state_fields(state, driver_states_value)
     log(config, "[model] ready")
