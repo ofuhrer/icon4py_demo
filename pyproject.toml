@@ -7,7 +7,6 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = [
-    "packages/icon-grid-generator/tests",
     "test_icon4py_helper.py",
     "test_grid_generator_icon4py_integration.py",
 ]
