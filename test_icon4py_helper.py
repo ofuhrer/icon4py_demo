@@ -69,11 +69,16 @@ def synthetic_grid_and_state():
                     ]
                 ),
             ),
-            "surface_pressure": (("time", "cell"), np.array([[100000.0] * 4, [99900.0] * 4])),
+            "surface_pressure": (
+                ("time", "cell"),
+                np.array([[100000.0] * 4, [99900.0] * 4]),
+            ),
         },
         coords={"time": np.arange(2), "full_level": np.arange(3), "cell": np.arange(4)},
     )
-    instants = [dataset.isel(time=index, drop=True) for index in range(dataset.sizes["time"])]
+    instants = [
+        dataset.isel(time=index, drop=True) for index in range(dataset.sizes["time"])
+    ]
     state = {
         "xarray": instants[-1],
         "temperature": instants[-1]["temperature"],
@@ -86,14 +91,18 @@ def synthetic_grid_and_state():
 
 
 def test_check_config_normalizes_defaults_and_rejects_invalid_values():
-    config = helper.check_config({"grid": "R2B4", "backend": "embedded", "log_level": "debug"})
+    config = helper.check_config(
+        {"grid": "R2B4", "backend": "embedded", "log_level": "debug"}
+    )
 
     assert config["grid"] == "R2B4"
     assert config["log_level"] == "debug"
     assert config["gt4py_cache_dir"].endswith(".gt4py_cache")
     assert "suppress_expected_warnings" not in config
     assert config["suppress_warnings"] is True
-    assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(157.8125)
+    assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(
+        157.8125
+    )
 
     with pytest.raises(ValueError, match="Invalid backend"):
         helper.check_config({"backend": "not-a-backend"})
@@ -104,17 +113,25 @@ def test_check_config_normalizes_defaults_and_rejects_invalid_values():
 
 
 def test_r02b03_grid_option_is_available():
-    config = helper.check_config({"grid": "R02B03", "backend": "embedded", "log_level": "quiet"})
+    config = helper.check_config(
+        {"grid": "R02B03", "backend": "embedded", "log_level": "quiet"}
+    )
 
     assert "R02B03" in helper.available_grids()
-    assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(315.625)
+    assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(
+        315.625
+    )
 
 
 def test_check_config_accepts_generated_grid_names():
-    config = helper.check_config({"grid": "R2B3", "backend": "embedded", "log_level": "quiet"})
+    config = helper.check_config(
+        {"grid": "R2B3", "backend": "embedded", "log_level": "quiet"}
+    )
 
     assert config["grid"] == "R2B3"
-    assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(315.625)
+    assert config["timestep_stability"]["effective_mesh_size_km"] == pytest.approx(
+        315.625
+    )
 
 
 def test_check_config_accepts_old_warning_key_as_alias():
@@ -189,7 +206,10 @@ def test_configure_gt4py_cache_sets_local_persistent_cache(tmp_path, monkeypatch
         helper.gt4py_config.BUILD_CACHE_LIFETIME
         is helper.gt4py_config.BuildCacheLifetime.PERSISTENT
     )
-    assert gt4py_cache.get_cache_base_path(helper.gt4py_config.BUILD_CACHE_LIFETIME) == cache_root
+    assert (
+        gt4py_cache.get_cache_base_path(helper.gt4py_config.BUILD_CACHE_LIFETIME)
+        == cache_root
+    )
     assert helper.os.environ["GT4PY_BUILD_CACHE_DIR"] == str(tmp_path)
     assert helper.os.environ["GT4PY_BUILD_CACHE_LIFETIME"] == "persistent"
     assert helper.os.environ["TMPDIR"] == "/existing-tmpdir"
@@ -254,14 +274,19 @@ def test_create_state_keeps_backend_and_tracer_metadata():
     assert state["xarray"] is None
     assert "_grid" not in state
     assert "_config" not in state
+    assert "_runtime" not in state
 
 
 def test_build_icon4py_config_uses_positive_internal_timesteps():
     config = quiet_config()
-    grid = {
-        "kind": "R02B04",
-        "_vertical_grid_config": helper.v_grid.VerticalGridConfig(num_levels=config["levels"]),
-    }
+    grid = helper.IconGrid(
+        {"kind": "R02B04"},
+        runtime=SimpleNamespace(
+            vertical_grid_config=helper.v_grid.VerticalGridConfig(
+                num_levels=config["levels"]
+            ),
+        ),
+    )
     state = {
         "tracers": {},
     }
@@ -287,17 +312,21 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
         "static_field_factories": static_fields,
     }
     prognostic_state = object()
-    grid = {
-        "kind": "R02B04",
-        "backend": "embedded",
-        "_vertical_grid_config": helper.v_grid.VerticalGridConfig(num_levels=config["levels"]),
-        "_runtime": SimpleNamespace(
+    grid = helper.IconGrid(
+        {
+            "kind": "R02B04",
+            "backend": "embedded",
+        },
+        runtime=SimpleNamespace(
             backend=backend,
             allocator=allocator,
             icon_grid=icon_grid,
+            vertical_grid_config=helper.v_grid.VerticalGridConfig(
+                num_levels=config["levels"]
+            ),
         ),
-    }
-    state = {"tracers": {}}
+    )
+    state = helper.IconState({"tracers": {}})
     calls = {}
 
     def fail_initialize_driver(**kwargs):
@@ -318,17 +347,25 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
         calls["update_xarray_state"] = (state_arg, prognostic_arg, simulation_datetime)
         state_arg["xarray"] = xr.Dataset()
 
-    monkeypatch.setattr(helper.standalone_driver, "initialize_driver", fail_initialize_driver)
-    monkeypatch.setattr(helper, "initialize_static_context", fake_initialize_static_context)
     monkeypatch.setattr(
-        helper.prognostics, "initialize_prognostic_state", fake_initialize_prognostic_state
+        helper.standalone_driver, "initialize_driver", fail_initialize_driver
     )
-    monkeypatch.setattr(helper.initial_condition, "create", fake_initial_condition_create)
+    monkeypatch.setattr(
+        helper, "initialize_static_context", fake_initialize_static_context
+    )
+    monkeypatch.setattr(
+        helper.prognostics,
+        "initialize_prognostic_state",
+        fake_initialize_prognostic_state,
+    )
+    monkeypatch.setattr(
+        helper.initial_condition, "create", fake_initial_condition_create
+    )
     monkeypatch.setattr(helper, "update_xarray_state", fake_update_xarray_state)
 
     helper.init_state(grid, state, "JW26", config)
 
-    runtime = state["_runtime"]
+    runtime = state.runtime
     assert calls["initialize_static_context"][0] is grid
     assert calls["initialize_static_context"][2] == config
     assert calls["initialize_prognostic_state"] == {
@@ -344,7 +381,9 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     assert runtime.static_field_factories is static_fields
 
 
-def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeypatch, tmp_path):
+def test_create_model_initializes_driver_and_removes_disabled_output_dir(
+    monkeypatch, tmp_path
+):
     config = quiet_config()
     allocator = object()
     icon_grid = object()
@@ -366,19 +405,21 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeyp
         static_field_factories=static_fields,
         granules=object(),
     )
-    grid = {
-        "kind": "R02B04",
-        "backend": "embedded",
-        "_runtime": SimpleNamespace(
+    grid = helper.IconGrid(
+        {
+            "kind": "R02B04",
+            "backend": "embedded",
+        },
+        runtime=SimpleNamespace(
             allocator=allocator,
             manager=object(),
             process_props=object(),
             backend=object(),
         ),
-    }
-    state = {
-        "xarray": None,
-        "_runtime": helper.StateRuntime(
+    )
+    state = helper.IconState(
+        {"xarray": None},
+        runtime=helper.StateRuntime(
             grid=grid,
             icon_config=icon_config,
             decomposition_info=object(),
@@ -388,7 +429,7 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeyp
             static_field_factories=object(),
             prognostic_state_now=prognostic_state,
         ),
-    }
+    )
     calls = {}
 
     def fake_initialize_driver(**kwargs):
@@ -407,9 +448,13 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeyp
     def fake_validate_granule_state_consistency(**kwargs):
         calls["validate_granule_state_consistency"] = kwargs
 
-    monkeypatch.setattr(helper.standalone_driver, "initialize_driver", fake_initialize_driver)
     monkeypatch.setattr(
-        helper.diagnostics, "initialize_diagnostic_state", fake_initialize_diagnostic_state
+        helper.standalone_driver, "initialize_driver", fake_initialize_driver
+    )
+    monkeypatch.setattr(
+        helper.diagnostics,
+        "initialize_diagnostic_state",
+        fake_initialize_diagnostic_state,
     )
     monkeypatch.setattr(
         helper.driver_states, "assemble_driver_states", fake_assemble_driver_states
@@ -425,12 +470,12 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeyp
     assert model.driver is icon_driver
     assert calls["initialize_driver"] == {
         "config": icon_config,
-        "grid_manager": grid["_runtime"].manager,
-        "process_props": grid["_runtime"].process_props,
-        "backend": grid["_runtime"].backend,
+        "grid_manager": grid.runtime.manager,
+        "process_props": grid.runtime.process_props,
+        "backend": grid.runtime.backend,
     }
     assert not output_path.exists()
-    assert state["_runtime"].driver_states is driver_states_value
+    assert state.runtime.driver_states is driver_states_value
     assert calls["initialize_diagnostic_state"] == {
         "grid": icon_grid,
         "allocator": allocator,
@@ -442,7 +487,9 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(monkeyp
     assert calls["assemble_driver_states"]["static_fields"] is static_fields
     assert calls["assemble_driver_states"]["prognostic_state_now"] is prognostic_state
     assert calls["assemble_driver_states"]["diagnostic_state"] is diagnostic_state
-    assert calls["validate_granule_state_consistency"]["granules"] is icon_driver.granules
+    assert (
+        calls["validate_granule_state_consistency"]["granules"] is icon_driver.granules
+    )
 
 
 def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
@@ -479,7 +526,9 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
     assert grid_figure.data[0].type == "scatter3d"
 
     state = helper.create_state(grid, config, tracers=None)
-    assert [key for key in ["rho", "theta_v", "exner", "vn", "w"] if state[key] is not None] == []
+    assert [
+        key for key in ["rho", "theta_v", "exner", "vn", "w"] if state[key] is not None
+    ] == []
 
     try:
         helper.init_state(grid, state, "JW26", config)
@@ -488,7 +537,9 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
             exc.__class__.__name__ == "CompilationError"
             and "gridtools/fn/backend/naive.hpp" in str(exc)
         ):
-            pytest.skip("GT4Py GridTools C++ headers are not available in this environment.")
+            pytest.skip(
+                "GT4Py GridTools C++ headers are not available in this environment."
+            )
         raise
     assert {"cell", "level", "half_level", "edge"} <= set(state["xarray"].sizes)
     assert state["temperature"].sizes["level"] == config["levels"]
@@ -533,7 +584,9 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
         level=plot_level,
         projection="sphere",
     )
-    diagnostic_axes = helper.plot_diagnostics(diagnostics, fields=["temperature", "rho", "exner"])
+    diagnostic_axes = helper.plot_diagnostics(
+        diagnostics, fields=["temperature", "rho", "exner"]
+    )
 
     assert final_figure.data[0].type == "mesh3d"
     assert perturbation_figure.data[0].type == "mesh3d"
@@ -541,9 +594,13 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
 
 
 def test_public_create_grid_returns_icon4py_helper_shaped_grid():
-    grid = helper.create_python_grid("R01B00", options={"backend": "embedded", "levels": 5})
+    grid = helper.create_python_grid(
+        "R01B00", options={"backend": "embedded", "levels": 5}
+    )
 
-    assert {key: grid[key] for key in ["name", "kind", "dims", "num_levels", "backend"]} == {
+    assert {
+        key: grid[key] for key in ["name", "kind", "dims", "num_levels", "backend"]
+    } == {
         "name": "R01B00",
         "kind": "R01B00",
         "dims": {"cell": 20, "vertex": 12, "edge": 30},
@@ -556,8 +613,9 @@ def test_public_create_grid_returns_icon4py_helper_shaped_grid():
     assert grid["connectivity"]["edge_of_cell"].shape == (20, 3)
     assert grid["geometry"]["cell_area"].shape == (20,)
     assert grid["metadata"]["grid_root"] == 1
-    assert grid["_runtime"].manager.grid.num_cells == 20
-    assert grid["_runtime"].icon_grid is grid["_icon_grid"]
+    assert grid.runtime.manager.grid.num_cells == 20
+    assert "_icon_grid" not in grid
+    assert "_runtime" not in grid
 
 
 def test_diagnostics_and_plots_work_for_synthetic_xarray():
@@ -580,7 +638,9 @@ def test_diagnostics_and_plots_work_for_synthetic_xarray():
     axes = helper.plot_state(grid, state, fields=["temperature", "rho"], level=1)
     diag_axes = helper.plot_diagnostics(diagnostics, fields=["temperature"])
     poly_collections = [
-        collection for collection in ax.collections if isinstance(collection, PolyCollection)
+        collection
+        for collection in ax.collections
+        if isinstance(collection, PolyCollection)
     ]
 
     assert ax.get_title()
@@ -607,7 +667,9 @@ def test_plot_diagnostics_resolves_common_icon_field_aliases():
     axes = helper.plot_diagnostics(diagnostics, fields=["rho", "exner"])
 
     assert [axis.get_ylabel() for axis in axes] == ["rho", "exner"]
-    assert all(line.get_marker() in {None, "None", ""} for axis in axes for line in axis.lines)
+    assert all(
+        line.get_marker() in {None, "None", ""} for axis in axes for line in axis.lines
+    )
 
 
 def test_plot_field_accepts_xarray_dataarray_and_perturbations():
@@ -615,7 +677,9 @@ def test_plot_field_accepts_xarray_dataarray_and_perturbations():
     perturbation = state["temperature"] - state["temperature"].mean(dim="cell")
 
     ax = helper.plot_field(grid, state["temperature"], level=1, title="temperature")
-    delta_ax = helper.plot_field(grid, perturbation, level=1, title="temperature perturbation")
+    delta_ax = helper.plot_field(
+        grid, perturbation, level=1, title="temperature perturbation"
+    )
 
     assert ax.get_title() == "temperature"
     assert delta_ax.get_title() == "temperature perturbation"
@@ -626,7 +690,9 @@ def test_plot_field_with_no_state_draws_flat_gridlines():
 
     ax = helper.plot_field(grid, None)
     poly_collections = [
-        collection for collection in ax.collections if isinstance(collection, PolyCollection)
+        collection
+        for collection in ax.collections
+        if isinstance(collection, PolyCollection)
     ]
 
     assert ax.get_title()

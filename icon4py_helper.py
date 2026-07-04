@@ -8,7 +8,6 @@ import json
 import os
 import pathlib
 import re
-import uuid
 import warnings
 from dataclasses import dataclass
 from functools import partial
@@ -18,7 +17,9 @@ from typing import Any
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
 venv_bin = PROJECT_ROOT / ".venv" / "bin"
-if venv_bin.exists() and str(venv_bin) not in os.environ.get("PATH", "").split(os.pathsep):
+if venv_bin.exists() and str(venv_bin) not in os.environ.get("PATH", "").split(
+    os.pathsep
+):
     os.environ["PATH"] = f"{venv_bin}{os.pathsep}{os.environ.get('PATH', '')}"
 
 import gt4py.next as gtx
@@ -31,21 +32,31 @@ from matplotlib.collections import PolyCollection
 
 from icon4py.model.atmosphere.diffusion import diffusion
 from icon4py.model.atmosphere.dycore import solve_nonhydro
-from icon4py.model.common import dimension as dims, model_backends, model_options, topography
+from icon4py.model.common import (
+    dimension as dims,
+    model_backends,
+    model_options,
+    topography,
+)
 from icon4py.model.common.decomposition import definitions as decomp_defs
 from icon4py.model.common.grid import vertical as v_grid
 from icon4py.model.common.interpolation import (
     interpolation_attributes as intp_attr,
     interpolation_factory,
 )
-from icon4py.model.common.metrics import metrics_attributes as metrics_attr, metrics_factory
+from icon4py.model.common.metrics import (
+    metrics_attributes as metrics_attr,
+    metrics_factory,
+)
 from icon4py.model.common.states import (
     diagnostic_state as diagnostics,
     prognostic_state as prognostics,
     tracer_state,
 )
 from icon4py.model.common.topography import config as topo_config
-from icon4py.model.common.topography.analytical import jablonowski_williamson as topo_jw
+from icon4py.model.common.topography.analytical import (
+    jablonowski_williamson as topo_jw,
+)
 from icon4py.model.standalone_driver import (
     config as driver_config,
     driver_io,
@@ -59,8 +70,7 @@ from icon4py.model.standalone_driver.initial_condition.analytical import (
     jablonowski_williamson as ic_jw,
 )
 
-from grid_generator import icon_netcdf
-from grid_generator.grid_generator import GeneratedGrid, generate_grid
+from grid_generator import generate_grid
 
 
 @dataclass(frozen=True)
@@ -98,6 +108,40 @@ class StateRuntime:
     driver: Any = None
     driver_states: Any = None
     step_count: int = 0
+
+
+class IconGrid(dict):
+    """Dictionary-shaped public grid data plus explicit ICON4Py runtime context."""
+
+    def __init__(self, *args, runtime=None, config=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.runtime = runtime
+        self.config = config
+
+
+class IconState(dict):
+    """Dictionary-shaped public atmospheric state plus explicit runtime context."""
+
+    def __init__(self, *args, runtime=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.runtime = runtime
+
+
+@dataclass(frozen=True)
+class BackendRuntime:
+    backend: Any
+    allocator: Any
+    process_props: Any
+    vertical_grid_config: Any
+
+
+@dataclass(frozen=True)
+class PlotRequest:
+    arr: Any
+    field: str | None
+    level: int | None
+    time: Any
+    grid_only: bool = False
 
 
 DEFAULT_CONFIG = {
@@ -175,7 +219,9 @@ def timestep_stability_limits(config):
         return None
 
     max_dynamics_substep_seconds = 1.8 * mesh_size_km
-    max_dtime_for_substeps_seconds = max_dynamics_substep_seconds * config["ndyn_substeps"]
+    max_dtime_for_substeps_seconds = (
+        max_dynamics_substep_seconds * config["ndyn_substeps"]
+    )
     return {
         "effective_mesh_size_km": mesh_size_km,
         "dynamics_substep_seconds": config["dtime_seconds"] / config["ndyn_substeps"],
@@ -221,7 +267,9 @@ def check_config(config=None):
     merged = normalize_config(config)
     grid_name = str(merged["grid"]).upper()
     if parse_icon_grid_name(grid_name) is None:
-        raise ValueError("Config value 'grid' must have the form RxxByy, for example R02B03.")
+        raise ValueError(
+            "Config value 'grid' must have the form RxxByy, for example R02B03."
+        )
     if merged["backend"] not in model_backends.BACKENDS:
         raise ValueError(
             f"Invalid backend {merged['backend']!r}. Use one of {sorted(model_backends.BACKENDS)}."
@@ -242,9 +290,13 @@ def check_config(config=None):
         raise ValueError("Config value 'baroclinic_amplitude' must be non-negative.")
     cache_lifetime = str(merged["gt4py_cache_lifetime"]).lower()
     if cache_lifetime not in {"session", "persistent"}:
-        raise ValueError("Config value 'gt4py_cache_lifetime' must be 'session' or 'persistent'.")
+        raise ValueError(
+            "Config value 'gt4py_cache_lifetime' must be 'session' or 'persistent'."
+        )
     merged["gt4py_cache_lifetime"] = cache_lifetime
-    merged["gt4py_cache_dir"] = str(pathlib.Path(merged["gt4py_cache_dir"]).expanduser())
+    merged["gt4py_cache_dir"] = str(
+        pathlib.Path(merged["gt4py_cache_dir"]).expanduser()
+    )
     if not isinstance(merged["suppress_warnings"], bool):
         raise ValueError("Config value 'suppress_warnings' must be True or False.")
     merged["timestep_stability"] = timestep_stability_limits(merged)
@@ -285,9 +337,23 @@ def require_matching_grid(grid, state):
         raise ValueError("The state was not created from the supplied grid.")
 
 
-def configure_gt4py_cache(config):
+def _grid_runtime(grid):
+    runtime = getattr(grid, "runtime", None)
+    if runtime is None:
+        raise ValueError("Grid has no ICON4Py runtime; create it with 'create_grid'.")
+    return runtime
+
+
+def _state_runtime(state):
+    runtime = getattr(state, "runtime", None)
+    if runtime is None:
+        raise ValueError("State has not been initialized yet; call 'init_state' first.")
+    return runtime
+
+
+def configure_gt4py_cache(config, *, validate=True):
     """Point GT4Py's generated-code cache at the working tree."""
-    config = check_config(config)
+    config = check_config(config) if validate else config
     cache_root = pathlib.Path(config["gt4py_cache_dir"]).expanduser().resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -306,7 +372,10 @@ def configure_gt4py_cache(config):
         f"({config['gt4py_cache_lifetime']})",
         level="info",
     )
-    if gt4py_config.BUILD_CACHE_LIFETIME is not gt4py_config.BuildCacheLifetime.PERSISTENT:
+    if (
+        gt4py_config.BUILD_CACHE_LIFETIME
+        is not gt4py_config.BuildCacheLifetime.PERSISTENT
+    ):
         log(
             config,
             "[cache] GT4Py session caches use Python's temporary directory; "
@@ -317,9 +386,9 @@ def configure_gt4py_cache(config):
     return cache_root
 
 
-def configure_warning_filters(config):
+def configure_warning_filters(config, *, validate=True):
     """Suppress noisy, expected notebook warnings while keeping unexpected warnings visible."""
-    config = check_config(config)
+    config = check_config(config) if validate else config
     if not config["suppress_warnings"]:
         return
 
@@ -389,9 +458,13 @@ def clip_polygon_longitude(polygon, xmin=-180.0, xmax=180.0):
             return vertices
         clipped = []
         previous = vertices[-1]
-        previous_inside = previous[0] >= boundary if keep_above else previous[0] <= boundary
+        previous_inside = (
+            previous[0] >= boundary if keep_above else previous[0] <= boundary
+        )
         for current in vertices:
-            current_inside = current[0] >= boundary if keep_above else current[0] <= boundary
+            current_inside = (
+                current[0] >= boundary if keep_above else current[0] <= boundary
+            )
             if current_inside != previous_inside:
                 dx = current[0] - previous[0]
                 if dx != 0.0:
@@ -408,7 +481,9 @@ def clip_polygon_longitude(polygon, xmin=-180.0, xmax=180.0):
             previous_inside = current_inside
         return np.asarray(clipped, dtype=float)
 
-    clipped = clip_against_boundary(np.asarray(polygon, dtype=float), xmin, keep_above=True)
+    clipped = clip_against_boundary(
+        np.asarray(polygon, dtype=float), xmin, keep_above=True
+    )
     clipped = clip_against_boundary(clipped, xmax, keep_above=False)
     if len(clipped) < 3:
         return None
@@ -421,7 +496,9 @@ def clip_polygon_longitude(polygon, xmin=-180.0, xmax=180.0):
 
 def wrapped_cell_polygons(grid, values):
     """Return longitude-clipped ICON cell polygons and seam-wrapped copies."""
-    base_polygons = np.stack((grid["cell_vertex_lon"], grid["cell_vertex_lat"]), axis=-1)
+    base_polygons = np.stack(
+        (grid["cell_vertex_lon"], grid["cell_vertex_lat"]), axis=-1
+    )
     polygons = []
     polygon_values = []
     for polygon, value in zip(base_polygons, values, strict=True):
@@ -513,6 +590,7 @@ def create_python_grid(grid_name, options=None):
         options={
             "max_cells": resolved["max_cells"],
             "radius": resolved["radius"],
+            "sphere_radius": resolved["sphere_radius"],
             "include_edges": True,
         },
     )
@@ -523,33 +601,29 @@ def create_python_grid(grid_name, options=None):
     )
     cell_vertex_lon = plot_cell_vertex_longitudes(generated)
 
-    return {
-        "name": generated.name,
-        "kind": generated.name,
-        "file": None,
-        "lon": generated.lon,
-        "lat": generated.lat,
-        "cell_vertex_lon": cell_vertex_lon,
-        "cell_vertex_lat": generated.cell_vertex_lat,
-        "dims": generated.dims,
-        "num_levels": resolved["levels"],
-        "vertical": vertical,
-        "vertical_interfaces": vertical["interface_height"].values,
-        "vertical_layer_thickness": vertical["layer_thickness"].values,
-        "backend": resolved["backend"],
-        "generated": generated,
-        "connectivity": public_python_grid_connectivity(generated),
-        "geometry": public_python_grid_geometry(generated, resolved["sphere_radius"]),
-        "metadata": public_python_grid_metadata(generated, resolved["sphere_radius"]),
-        "_config": dict(resolved),
-        "_runtime": runtime,
-        "_backend": runtime.backend,
-        "_allocator": runtime.allocator,
-        "_process_props": runtime.process_props,
-        "_vertical_grid_config": runtime.vertical_grid_config,
-        "_manager": runtime.manager,
-        "_icon_grid": runtime.icon_grid,
-    }
+    return IconGrid(
+        {
+            "name": generated.name,
+            "kind": generated.name,
+            "file": None,
+            "lon": generated.lon,
+            "lat": generated.lat,
+            "cell_vertex_lon": cell_vertex_lon,
+            "cell_vertex_lat": generated.cell_vertex_lat,
+            "dims": generated.dims,
+            "num_levels": resolved["levels"],
+            "vertical": vertical,
+            "vertical_interfaces": vertical["interface_height"].values,
+            "vertical_layer_thickness": vertical["layer_thickness"].values,
+            "backend": resolved["backend"],
+            "generated": generated,
+            "connectivity": generated.connectivity,
+            "geometry": generated.geometry,
+            "metadata": generated.metadata,
+        },
+        runtime=runtime,
+        config=dict(resolved),
+    )
 
 
 def resolve_python_grid_options(options):
@@ -563,19 +637,24 @@ def resolve_python_grid_options(options):
     return resolved
 
 
-def create_python_grid_runtime(generated: GeneratedGrid, options):
-    from icon4py.model.common.decomposition import halo
-    from icon4py.model.common.grid import base, grid_manager, grid_refinement, icon
-    from icon4py.model.common.utils import data_allocation as data_alloc
-
+def _create_backend_runtime(options):
     backend_descriptor = driver_utils.get_backend_from_name(options["backend"])
     if isinstance(backend_descriptor, dict):
         backend_descriptor = dict(backend_descriptor)
         backend_descriptor["cached"] = True
     backend = model_options.customize_backend(None, backend_descriptor)
-    allocator = model_backends.get_allocator(backend)
-    process_props = decomp_defs.get_process_properties(decomp_defs.SingleNodeRun())
-    vertical_grid_config = v_grid.VerticalGridConfig(num_levels=options["levels"])
+    return BackendRuntime(
+        backend=backend,
+        allocator=model_backends.get_allocator(backend),
+        process_props=decomp_defs.get_process_properties(decomp_defs.SingleNodeRun()),
+        vertical_grid_config=v_grid.VerticalGridConfig(num_levels=options["levels"]),
+    )
+
+
+def _create_decomposition_info(generated: Any, allocator):
+    from icon4py.model.common.decomposition import halo
+    from icon4py.model.common.grid import base
+    from icon4py.model.common.utils import data_allocation as data_alloc
 
     xp = data_alloc.import_array_ns(allocator)
     horizontal_size = base.HorizontalGridSize(
@@ -583,9 +662,20 @@ def create_python_grid_runtime(generated: GeneratedGrid, options):
         num_edges=generated.dims["edge"],
         num_cells=generated.dims["cell"],
     )
-    decomposition_info = halo.NoHalos(horizontal_size, allocator=allocator)(
+    return halo.NoHalos(horizontal_size, allocator=allocator)(
         xp.zeros(generated.dims["cell"], dtype=gtx.int32)
     )
+
+
+def _create_icon_grid(generated: Any, backend_runtime, decomposition_info, options):
+    from icon4py.model.common.grid import base, grid_manager, grid_refinement, icon
+
+    horizontal_size = base.HorizontalGridSize(
+        num_vertices=generated.dims["vertex"],
+        num_edges=generated.dims["edge"],
+        num_cells=generated.dims["cell"],
+    )
+    allocator = backend_runtime.allocator
     refinement_fields = python_grid_refinement_fields(generated, allocator)
     start_index, end_index = icon.get_start_and_end_index(
         partial(
@@ -595,9 +685,10 @@ def create_python_grid_runtime(generated: GeneratedGrid, options):
         )
     )
     neighbor_tables = python_grid_neighbor_tables(generated)
+    # ICON4Py currently derives secondary connectivities through an internal helper.
     neighbor_tables.update(grid_manager._get_derived_connectivities(neighbor_tables))
-    icon_grid = icon.icon_grid(
-        id_=python_grid_uuid(generated),
+    return icon.icon_grid(
+        id_=generated.metadata["uuidOfHGrid"],
         allocator=allocator,
         config=base.GridConfig(
             horizontal_config=horizontal_size,
@@ -620,42 +711,62 @@ def create_python_grid_runtime(generated: GeneratedGrid, options):
         ),
         refinement_control=refinement_fields,
     )
-    manager = InMemoryGridManager(
+
+
+def _create_in_memory_grid_manager(
+    generated: Any, icon_grid, decomposition_info, allocator
+):
+    return InMemoryGridManager(
         grid=icon_grid,
         decomposition_info=decomposition_info,
         coordinates=python_grid_coordinates(generated, allocator),
         geometry_fields=python_grid_geometry_fields(
             generated,
-            options["sphere_radius"],
             allocator,
         ),
         file_path=f"python-generated:{generated.name}",
     )
+
+
+def create_python_grid_runtime(generated: Any, options):
+    backend_runtime = _create_backend_runtime(options)
+    decomposition_info = _create_decomposition_info(
+        generated, backend_runtime.allocator
+    )
+    icon_grid = _create_icon_grid(
+        generated, backend_runtime, decomposition_info, options
+    )
+    manager = _create_in_memory_grid_manager(
+        generated,
+        icon_grid,
+        decomposition_info,
+        backend_runtime.allocator,
+    )
     return GridRuntime(
-        backend=backend,
-        allocator=allocator,
-        process_props=process_props,
-        vertical_grid_config=vertical_grid_config,
+        backend=backend_runtime.backend,
+        allocator=backend_runtime.allocator,
+        process_props=backend_runtime.process_props,
+        vertical_grid_config=backend_runtime.vertical_grid_config,
         manager=manager,
         icon_grid=icon_grid,
     )
 
 
-def python_grid_neighbor_tables(generated: GeneratedGrid):
-    connectivity = icon_netcdf._connectivity(generated)
+def python_grid_neighbor_tables(generated: Any):
+    tables = generated.neighbor_tables
     return {
-        dims.C2E2C: connectivity["c2c"],
-        dims.C2E: connectivity["c2e"],
-        dims.E2C: np.asarray(generated.edge_cells, dtype=np.int32),
-        dims.V2E: zero_based_with_skip(connectivity["v2e"]),
-        dims.V2C: zero_based_with_skip(connectivity["v2c"]),
-        dims.C2V: np.asarray(generated.cells, dtype=np.int32),
-        dims.V2E2V: zero_based_with_skip(connectivity["v2v"]),
-        dims.E2V: np.asarray(generated.edges, dtype=np.int32),
+        dims.C2E2C: tables["c2e2c"],
+        dims.C2E: tables["c2e"],
+        dims.E2C: tables["e2c"],
+        dims.V2E: tables["v2e"],
+        dims.V2C: tables["v2c"],
+        dims.C2V: tables["c2v"],
+        dims.V2E2V: tables["v2e2v"],
+        dims.E2V: tables["e2v"],
     }
 
 
-def python_grid_refinement_fields(generated: GeneratedGrid, allocator):
+def python_grid_refinement_fields(generated: Any, allocator):
     return {
         dims.CellDim: gtx.as_field(
             (dims.CellDim,),
@@ -675,16 +786,23 @@ def python_grid_refinement_fields(generated: GeneratedGrid, allocator):
     }
 
 
-def python_grid_coordinates(generated: GeneratedGrid, allocator):
-    edge_lon, edge_lat = icon_netcdf._lon_lat(icon_netcdf._edge_centers(generated))
+def python_grid_coordinates(generated: Any, allocator):
     return {
         dims.CellDim: {
-            "lat": gtx.as_field((dims.CellDim,), np.radians(generated.lat), allocator=allocator),
-            "lon": gtx.as_field((dims.CellDim,), np.radians(generated.lon), allocator=allocator),
+            "lat": gtx.as_field(
+                (dims.CellDim,), np.radians(generated.lat), allocator=allocator
+            ),
+            "lon": gtx.as_field(
+                (dims.CellDim,), np.radians(generated.lon), allocator=allocator
+            ),
         },
         dims.EdgeDim: {
-            "lat": gtx.as_field((dims.EdgeDim,), edge_lat, allocator=allocator),
-            "lon": gtx.as_field((dims.EdgeDim,), edge_lon, allocator=allocator),
+            "lat": gtx.as_field(
+                (dims.EdgeDim,), np.radians(generated.edge_lat), allocator=allocator
+            ),
+            "lon": gtx.as_field(
+                (dims.EdgeDim,), np.radians(generated.edge_lon), allocator=allocator
+            ),
         },
         dims.VertexDim: {
             "lat": gtx.as_field(
@@ -697,38 +815,37 @@ def python_grid_coordinates(generated: GeneratedGrid, allocator):
     }
 
 
-def python_grid_geometry_fields(generated: GeneratedGrid, sphere_radius, allocator):
+def python_grid_geometry_fields(generated: Any, allocator):
     from icon4py.model.common.grid import gridfile
 
-    connectivity = icon_netcdf._connectivity(generated)
-    edge_lengths = icon_netcdf._edge_lengths(generated, sphere_radius)
+    geometry = generated.geometry
     return {
         gridfile.GeometryName.CELL_AREA.value: gtx.as_field(
             (dims.CellDim,),
-            icon_netcdf._cell_areas(generated, sphere_radius),
+            geometry["cell_area"],
             allocator=allocator,
         ),
         gridfile.GeometryName.DUAL_AREA.value: gtx.as_field(
             (dims.VertexDim,),
-            icon_netcdf._dual_areas(generated, sphere_radius),
+            geometry["dual_area"],
             allocator=allocator,
         ),
         gridfile.GeometryName.EDGE_LENGTH.value: gtx.as_field(
-            (dims.EdgeDim,), edge_lengths, allocator=allocator
+            (dims.EdgeDim,), geometry["edge_length"], allocator=allocator
         ),
         gridfile.GeometryName.DUAL_EDGE_LENGTH.value: gtx.as_field(
             (dims.EdgeDim,),
-            icon_netcdf._dual_edge_lengths(generated, sphere_radius),
+            geometry["dual_edge_length"],
             allocator=allocator,
         ),
         gridfile.GeometryName.EDGE_CELL_DISTANCE.value: gtx.as_field(
             (dims.EdgeDim, dims.E2CDim),
-            icon_netcdf._edge_cell_distances(generated, sphere_radius),
+            geometry["edge_cell_distance"],
             allocator=allocator,
         ),
         gridfile.GeometryName.EDGE_VERTEX_DISTANCE.value: gtx.as_field(
             (dims.EdgeDim, dims.E2VDim),
-            np.column_stack((edge_lengths * 0.5, edge_lengths * 0.5)),
+            geometry["edge_vert_distance"],
             allocator=allocator,
         ),
         gridfile.GeometryName.TANGENT_ORIENTATION.value: gtx.as_field(
@@ -738,59 +855,18 @@ def python_grid_geometry_fields(generated: GeneratedGrid, sphere_radius, allocat
         ),
         gridfile.GeometryName.CELL_NORMAL_ORIENTATION.value: gtx.as_field(
             (dims.CellDim, dims.C2EDim),
-            connectivity["orientation_of_normal"].astype(np.float64),
+            geometry["orientation_of_normal"].astype(np.float64),
             allocator=allocator,
         ),
         gridfile.GeometryName.EDGE_ORIENTATION_ON_VERTEX.value: gtx.as_field(
             (dims.VertexDim, dims.V2EDim),
-            connectivity["edge_orientation"],
+            geometry["edge_orientation"],
             allocator=allocator,
         ),
     }
 
 
-def public_python_grid_connectivity(generated: GeneratedGrid):
-    connectivity = icon_netcdf._connectivity(generated)
-    return {
-        "edge_of_cell": connectivity["c2e"],
-        "vertex_of_cell": generated.cells,
-        "neighbor_cell_index": connectivity["c2c"],
-        "adjacent_cell_of_edge": generated.edge_cells,
-        "edge_vertices": generated.edges,
-        "cells_of_vertex": zero_based_with_skip(connectivity["v2c"]),
-        "edges_of_vertex": zero_based_with_skip(connectivity["v2e"]),
-        "vertices_of_vertex": zero_based_with_skip(connectivity["v2v"]),
-    }
-
-
-def public_python_grid_geometry(generated: GeneratedGrid, sphere_radius):
-    connectivity = icon_netcdf._connectivity(generated)
-    edge_lengths = icon_netcdf._edge_lengths(generated, sphere_radius)
-    return {
-        "cell_area": icon_netcdf._cell_areas(generated, sphere_radius),
-        "dual_area": icon_netcdf._dual_areas(generated, sphere_radius),
-        "edge_length": edge_lengths,
-        "dual_edge_length": icon_netcdf._dual_edge_lengths(generated, sphere_radius),
-        "edge_cell_distance": icon_netcdf._edge_cell_distances(generated, sphere_radius),
-        "edge_vert_distance": np.column_stack((edge_lengths * 0.5, edge_lengths * 0.5)),
-        "orientation_of_normal": connectivity["orientation_of_normal"],
-        "edge_system_orientation": np.ones(generated.dims["edge"], dtype=np.int32),
-        "edge_orientation": connectivity["edge_orientation"],
-    }
-
-
-def public_python_grid_metadata(generated: GeneratedGrid, sphere_radius):
-    return {
-        "uuidOfHGrid": python_grid_uuid(generated),
-        "grid_root": generated.spec.root,
-        "grid_level": generated.spec.bisections,
-        "sphere_radius": sphere_radius,
-        "grid_geometry": 1,
-        "grid_cell_type": 3,
-    }
-
-
-def plot_cell_vertex_longitudes(generated: GeneratedGrid):
+def plot_cell_vertex_longitudes(generated: Any):
     lon = ((generated.lon + 180.0) % 360.0) - 180.0
     vertex_lon = ((generated.cell_vertex_lon + 180.0) % 360.0) - 180.0
     polar_vertices = np.abs(generated.cell_vertex_lat) > 89.0
@@ -798,22 +874,18 @@ def plot_cell_vertex_longitudes(generated: GeneratedGrid):
     vertex_lon[polar_vertices] = np.broadcast_to(lon[:, np.newaxis], vertex_lon.shape)[
         polar_vertices
     ]
-    vertex_lon = np.where(vertex_lon - lon[:, np.newaxis] > 180.0, vertex_lon - 360.0, vertex_lon)
-    return np.where(vertex_lon - lon[:, np.newaxis] < -180.0, vertex_lon + 360.0, vertex_lon)
-
-
-def zero_based_with_skip(one_based):
-    return np.where(one_based == 0, -1, one_based - 1).astype(np.int32)
-
-
-def python_grid_uuid(generated: GeneratedGrid):
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"icon4py-demo/{generated.name}"))
+    vertex_lon = np.where(
+        vertex_lon - lon[:, np.newaxis] > 180.0, vertex_lon - 360.0, vertex_lon
+    )
+    return np.where(
+        vertex_lon - lon[:, np.newaxis] < -180.0, vertex_lon + 360.0, vertex_lon
+    )
 
 
 def create_grid(config):
     config = check_config(config)
-    configure_warning_filters(config)
-    configure_gt4py_cache(config)
+    configure_warning_filters(config, validate=False)
+    configure_gt4py_cache(config, validate=False)
     grid_name = config["grid"].upper()
     log(config, f"[grid] generating {grid_name} grid in memory")
     grid = create_python_grid(
@@ -826,7 +898,7 @@ def create_grid(config):
             "sphere_radius": DEFAULT_PYTHON_GRID_OPTIONS["sphere_radius"],
         },
     )
-    grid["_config"] = dict(config)
+    grid.config = dict(config)
     vertical = grid["vertical"]
 
     log(
@@ -847,10 +919,10 @@ def create_grid(config):
             config,
             str(
                 v_grid.VerticalGrid(
-                    grid["_runtime"].vertical_grid_config,
+                    _grid_runtime(grid).vertical_grid_config,
                     *v_grid.get_vct_a_and_vct_b(
-                        grid["_runtime"].vertical_grid_config,
-                        grid["_runtime"].allocator,
+                        _grid_runtime(grid).vertical_grid_config,
+                        _grid_runtime(grid).allocator,
                     ),
                 )
             ),
@@ -867,24 +939,29 @@ def create_state(grid, config, tracers=None):
         )
     tracer_names = {} if tracers is None else dict(tracers)
     log(
-        config, f"[state] creating empty state for {grid['kind']} with tracers={list(tracer_names)}"
+        config,
+        f"[state] creating empty state for {grid['kind']} with tracers={list(tracer_names)}",
     )
-    return {
-        "tracers": tracer_names,
-        "rho": None,
-        "theta_v": None,
-        "exner": None,
-        "vn": None,
-        "w": None,
-        "xarray": None,
-    }
+    return IconState(
+        {
+            "tracers": tracer_names,
+            "rho": None,
+            "theta_v": None,
+            "exner": None,
+            "vn": None,
+            "w": None,
+            "xarray": None,
+        }
+    )
 
 
 def prepare_current_xarray_state(fields, simulation_datetime, step_count=None):
     timestamp = np.datetime64(
         simulation_datetime.astimezone(dt.timezone.utc).replace(tzinfo=None)
     )
-    current = xr.Dataset({name: array.copy(deep=True) for name, array in fields.items()})
+    current = xr.Dataset(
+        {name: array.copy(deep=True) for name, array in fields.items()}
+    )
     current = current.assign_coords(time=timestamp)
     if step_count is not None:
         current = current.assign_attrs(step_count=int(step_count))
@@ -899,7 +976,7 @@ def update_public_xarray_fields(state, current):
 
 
 def update_public_prognostic_fields(state, prognostic):
-    state["_runtime"].prognostic_state_now = prognostic
+    _state_runtime(state).prognostic_state_now = prognostic
 
 
 def update_public_state_fields(state, driver_states_value):
@@ -909,12 +986,17 @@ def update_public_state_fields(state, driver_states_value):
 def initialize_static_context(grid, icon_config, config):
     """Build static fields needed by the analytical state initializer."""
     log(config, "[init] creating exchange/reduction runtimes")
-    runtime = grid["_runtime"]
+    runtime = _grid_runtime(grid)
     decomposition_info = runtime.manager.decomposition_info
     exchange = decomp_defs.create_exchange(runtime.process_props, decomposition_info)
-    global_reductions = decomp_defs.create_reduction(runtime.process_props, decomposition_info)
+    global_reductions = decomp_defs.create_reduction(
+        runtime.process_props, decomposition_info
+    )
 
-    log(config, "[init] creating vertical grid, topography, metrics, and interpolation fields")
+    log(
+        config,
+        "[init] creating vertical grid, topography, metrics, and interpolation fields",
+    )
     vertical_grid = driver_utils.create_vertical_grid(
         vertical_grid_config=icon_config.vertical_grid,
         allocator=runtime.allocator,
@@ -951,12 +1033,12 @@ def initialize_static_context(grid, icon_config, config):
 
 def build_xarray_state(state, prognostic_state, simulation_datetime):
     """Build current prognostic fields plus derived diagnostics as one xarray dataset."""
-    runtime = state["_runtime"]
+    runtime = _state_runtime(state)
     static_fields = runtime.static_field_factories
     if runtime.diagnostics_computer is None:
-        grid_runtime = runtime.grid["_runtime"]
+        grid_runtime_value = _grid_runtime(runtime.grid)
         runtime.diagnostics_computer = driver_io.DiagnosticsComputer(
-            grid=grid_runtime.icon_grid, backend=grid_runtime.backend
+            grid=grid_runtime_value.icon_grid, backend=grid_runtime_value.backend
         )
     output_state = driver_io.prognostic_state_to_dataarrays(prognostic_state)
     diagnostic_fields = runtime.diagnostics_computer.compute(
@@ -995,7 +1077,11 @@ def state_field_diagnostics(state, time=None):
     for field_name, values in ds.data_vars.items():
         if not np.issubdtype(values.dtype, np.number):
             continue
-        selected = values.isel(time=time) if time is not None and "time" in values.dims else values
+        selected = (
+            values.isel(time=time)
+            if time is not None and "time" in values.dims
+            else values
+        )
         array = np.asarray(selected)
         finite = np.isfinite(array)
         rows.append(
@@ -1012,8 +1098,17 @@ def state_field_diagnostics(state, time=None):
 
 def append_diagnostics(diagnostics_series, state, label):
     rows = state_field_diagnostics(state)
-    time_value = state["xarray"].coords["time"].values if "time" in state["xarray"].coords else None
-    step_count = state["_runtime"].step_count if "_runtime" in state else state["xarray"].attrs.get("step_count")
+    time_value = (
+        state["xarray"].coords["time"].values
+        if "time" in state["xarray"].coords
+        else None
+    )
+    runtime = getattr(state, "runtime", None)
+    step_count = (
+        runtime.step_count
+        if runtime is not None
+        else state["xarray"].attrs.get("step_count")
+    )
     diagnostics_series.append(
         {
             "step": step_count,
@@ -1040,8 +1135,10 @@ def build_icon4py_config(grid, state, testcase, config):
     return driver_config.ExperimentConfig(
         metrics=metrics_factory.MetricsConfig(),
         interpolation=interpolation_factory.InterpolationConfig(),
-        vertical_grid=grid["_vertical_grid_config"],
-        topography=topo_config.TopographyConfig(config=topo_jw.JablonowskiWilliamsonConfig()),
+        vertical_grid=_grid_runtime(grid).vertical_grid_config,
+        topography=topo_config.TopographyConfig(
+            config=topo_jw.JablonowskiWilliamsonConfig()
+        ),
         initial_condition=ic_config.InitialConditionConfig(
             config=ic_jw.JablonowskiWilliamsonConfig(
                 baroclinic_amplitude=config["baroclinic_amplitude"],
@@ -1069,7 +1166,7 @@ def init_state(grid, state, testcase="JW26", config=None):
 
     log(config, f"[init] building ICON4Py config for {testcase}")
     icon_config = build_icon4py_config(grid, state, testcase, config)
-    grid_runtime = grid["_runtime"]
+    grid_runtime_value = _grid_runtime(grid)
 
     log(config, "[init] preparing static grid context for analytical JW state")
     log(
@@ -1082,8 +1179,8 @@ def init_state(grid, state, testcase="JW26", config=None):
 
     log(config, "[init] allocating prognostic fields: rho, theta_v, exner, vn, w")
     prognostic_state_now = prognostics.initialize_prognostic_state(
-        grid=grid_runtime.icon_grid,
-        allocator=grid_runtime.allocator,
+        grid=grid_runtime_value.icon_grid,
+        allocator=grid_runtime_value.allocator,
         tracer_config=icon_config.tracer_config,
     )
 
@@ -1091,10 +1188,10 @@ def init_state(grid, state, testcase="JW26", config=None):
     initial_condition.create(
         config=icon_config.initial_condition,
         vertical_config=icon_config.vertical_grid,
-        grid=grid_runtime.icon_grid,
+        grid=grid_runtime_value.icon_grid,
         static_fields=static_context["static_field_factories"],
         prognostic_state_now=prognostic_state_now,
-        backend=grid_runtime.backend,
+        backend=grid_runtime_value.backend,
         exchange=static_context["exchange"],
     )
 
@@ -1108,7 +1205,7 @@ def init_state(grid, state, testcase="JW26", config=None):
         static_field_factories=static_context["static_field_factories"],
         prognostic_state_now=prognostic_state_now,
     )
-    state["_runtime"] = state_runtime
+    state.runtime = state_runtime
     update_xarray_state(
         state,
         prognostic_state_now,
@@ -1124,7 +1221,9 @@ def init_state(grid, state, testcase="JW26", config=None):
 def integrate_driver_steps(driver, driver_states_value, count):
     """Advance ICON4Py through its public integration hook for `count` timesteps."""
     if not hasattr(driver, "time_integration"):
-        raise RuntimeError("The installed ICON4Py driver does not expose time_integration().")
+        raise RuntimeError(
+            "The installed ICON4Py driver does not expose time_integration()."
+        )
 
     model_time_variables = driver.model_time_variables
     original_n_time_steps = model_time_variables.n_time_steps
@@ -1164,9 +1263,13 @@ class IconDycoreModel:
         """Advance the current state by `count` additional timesteps in place."""
         require_matching_backend(grid, self.config)
         if grid is not self.grid:
-            raise ValueError("The grid passed to 'step' must be the grid used to create the state.")
+            raise ValueError(
+                "The grid passed to 'step' must be the grid used to create the state."
+            )
         if not isinstance(count, int) or count < 1:
-            raise ValueError("Argument 'count' must be a positive integer timestep count.")
+            raise ValueError(
+                "Argument 'count' must be a positive integer timestep count."
+            )
 
         driver = self.driver
         log(
@@ -1175,9 +1278,11 @@ class IconDycoreModel:
             level="debug",
         )
 
-        runtime = state["_runtime"]
+        runtime = _state_runtime(state)
         if runtime.driver_states is None:
-            raise ValueError("State has no assembled driver states; call 'create_model' first.")
+            raise ValueError(
+                "State has no assembled driver states; call 'create_model' first."
+            )
         ds = runtime.driver_states
         integrate_driver_steps(driver, ds, count)
         runtime.step_count += count
@@ -1190,7 +1295,6 @@ class IconDycoreModel:
         if diagnostics is not None:
             append_diagnostics(diagnostics, state, f"step {runtime.step_count}")
 
-        update_public_state_fields(state, ds)
         current_time = format_datetime64(state["xarray"].coords["time"].values)
         log(
             self.config,
@@ -1203,18 +1307,16 @@ def create_model(grid, state, config=None):
     config = check_config(config)
     require_matching_backend(grid, config)
     require_matching_grid(grid, state)
-    if "_runtime" not in state:
-        raise ValueError("State has not been initialized yet; call 'init_state' first.")
-
-    runtime = state["_runtime"]
+    runtime = _state_runtime(state)
+    grid_runtime_value = _grid_runtime(grid)
     icon_driver = runtime.driver
     if icon_driver is None:
         log(config, "[model] initializing ICON4Py dycore/diffusion")
         icon_driver = standalone_driver.initialize_driver(
             config=runtime.icon_config,
-            grid_manager=grid["_runtime"].manager,
-            process_props=grid["_runtime"].process_props,
-            backend=grid["_runtime"].backend,
+            grid_manager=grid_runtime_value.manager,
+            process_props=grid_runtime_value.process_props,
+            backend=grid_runtime_value.backend,
         )
         remove_disabled_output_directory(icon_driver)
         runtime.driver = icon_driver
@@ -1225,11 +1327,11 @@ def create_model(grid, state, config=None):
     log(config, "[model] assembling time-step state", level="debug")
     diagnostic_state = diagnostics.initialize_diagnostic_state(
         grid=icon_driver.grid,
-        allocator=grid["_runtime"].allocator,
+        allocator=grid_runtime_value.allocator,
     )
     driver_states_value = driver_states.assemble_driver_states(
         grid=icon_driver.grid,
-        allocator=grid["_runtime"].allocator,
+        allocator=grid_runtime_value.allocator,
         backend=icon_driver.backend,
         exchange=icon_driver.exchange,
         static_fields=icon_driver.static_field_factories,
@@ -1255,7 +1357,9 @@ def select_vertical_level(arr, grid, level=None):
         if vertical_dim in arr.dims:
             resolved_level = grid["num_levels"] // 2 if level is None else level
             if not isinstance(resolved_level, int):
-                raise ValueError("Argument 'level' must be an integer vertical level index.")
+                raise ValueError(
+                    "Argument 'level' must be an integer vertical level index."
+                )
             if resolved_level < 0 or resolved_level >= arr.sizes[vertical_dim]:
                 raise ValueError(
                     f"Argument 'level' must be between 0 and {arr.sizes[vertical_dim] - 1} "
@@ -1268,7 +1372,9 @@ def select_vertical_level(arr, grid, level=None):
         raise ValueError(f"{name!r} is not cell-centered; dims are {arr.dims}.")
 
     if level is not None:
-        raise ValueError(f"{arr.name or 'field'} has no vertical dimension; omit 'level'.")
+        raise ValueError(
+            f"{arr.name or 'field'} has no vertical dimension; omit 'level'."
+        )
 
     return arr, None
 
@@ -1304,15 +1410,25 @@ def resolve_cell_field(grid, data, field=None, level=None, time=-1):
 
     if isinstance(data, xr.Dataset):
         if field is None:
-            raise ValueError("Argument 'field' is required when plotting an xarray Dataset.")
+            raise ValueError(
+                "Argument 'field' is required when plotting an xarray Dataset."
+            )
         if field not in data:
-            raise KeyError(f"{field!r} not in dataset variables: {list(data.data_vars)}")
-        return resolve_cell_field(grid, data[field], field=field, level=level, time=time)
+            raise KeyError(
+                f"{field!r} not in dataset variables: {list(data.data_vars)}"
+            )
+        return resolve_cell_field(
+            grid, data[field], field=field, level=level, time=time
+        )
 
     if isinstance(data, dict):
         if field is None:
-            raise ValueError("Argument 'field' is required when plotting a state dictionary.")
-        arr, resolved_level = select_cell_field(grid, data, field, level=level, time=time)
+            raise ValueError(
+                "Argument 'field' is required when plotting a state dictionary."
+            )
+        arr, resolved_level = select_cell_field(
+            grid, data, field, level=level, time=time
+        )
         return arr, field, resolved_level
 
     raise TypeError(
@@ -1437,7 +1553,9 @@ def plot_grid_sphere(grid, *, title=None, edgecolor="0.35", linewidth=1.0):
     return DisplayablePlotlyFigure(figure)
 
 
-def plot_field_sphere(grid, arr, field, level, time, *, title, cmap, vmin=None, vmax=None):
+def plot_field_sphere(
+    grid, arr, field, level, time, *, title, cmap, vmin=None, vmax=None
+):
     """Plot a cell-centered field as an interactive triangular mesh on a sphere."""
     go = load_plotly_graph_objects()
 
@@ -1484,6 +1602,106 @@ def plot_field_sphere(grid, arr, field, level, time, *, title, cmap, vmin=None, 
     return DisplayablePlotlyFigure(figure)
 
 
+def _validate_projection(projection):
+    if projection not in {"flat", "sphere"}:
+        raise ValueError("Argument 'projection' must be 'flat' or 'sphere'.")
+
+
+def _resolve_plot_request(grid, state, field, level, time):
+    if state is None:
+        if field is not None:
+            raise ValueError(
+                "Argument 'field' must be omitted when plotting gridlines."
+            )
+        return PlotRequest(arr=None, field=None, level=None, time=time, grid_only=True)
+
+    arr, field_label, resolved_level = resolve_cell_field(
+        grid,
+        state,
+        field=field,
+        level=level,
+        time=time,
+    )
+    return PlotRequest(
+        arr=arr,
+        field=field_label,
+        level=resolved_level,
+        time=time,
+    )
+
+
+def _plot_grid(grid, projection, *, title, ax, edgecolor, linewidth):
+    if projection == "flat":
+        return plot_grid_flat(
+            grid,
+            title=title,
+            ax=ax,
+            edgecolor=edgecolor,
+            linewidth=linewidth,
+        )
+
+    if ax is not None:
+        raise ValueError("Argument 'ax' is only supported with projection='flat'.")
+    return plot_grid_sphere(
+        grid,
+        title=title,
+        edgecolor=edgecolor,
+        linewidth=max(1.0, linewidth * 4.0),
+    )
+
+
+def _plot_cell_field(
+    grid,
+    request,
+    projection,
+    *,
+    title,
+    ax,
+    cmap,
+    edgecolor,
+    linewidth,
+    vmin,
+    vmax,
+    colorbar_label,
+    contours,
+    contour_color,
+    contour_linewidth,
+):
+    if projection == "flat":
+        return plot_field_flat(
+            grid,
+            request.arr,
+            request.field,
+            request.level,
+            request.time,
+            title=title,
+            ax=ax,
+            cmap=cmap,
+            edgecolor=edgecolor,
+            linewidth=linewidth,
+            vmin=vmin,
+            vmax=vmax,
+            colorbar_label=colorbar_label,
+            contours=contours,
+            contour_color=contour_color,
+            contour_linewidth=contour_linewidth,
+        )
+
+    if ax is not None:
+        raise ValueError("Argument 'ax' is only supported with projection='flat'.")
+    return plot_field_sphere(
+        grid,
+        request.arr,
+        request.field,
+        request.level,
+        request.time,
+        title=title,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+
 def plot_field(
     grid,
     state=None,
@@ -1505,69 +1723,33 @@ def plot_field(
     contour_linewidth=0.6,
 ):
     """Plot a cell-centered field, xarray expression, or only gridlines."""
-    if state is None:
-        if field is not None:
-            raise ValueError("Argument 'field' must be omitted when plotting gridlines.")
-        if projection == "flat":
-            return plot_grid_flat(
-                grid,
-                title=title,
-                ax=ax,
-                edgecolor=edgecolor,
-                linewidth=linewidth,
-            )
-        if projection == "sphere":
-            if ax is not None:
-                raise ValueError("Argument 'ax' is only supported with projection='flat'.")
-            return plot_grid_sphere(
-                grid,
-                title=title,
-                edgecolor=edgecolor,
-                linewidth=max(1.0, linewidth * 4.0),
-            )
-        raise ValueError("Argument 'projection' must be 'flat' or 'sphere'.")
-
-    arr, field_label, resolved_level = resolve_cell_field(
-        grid,
-        state,
-        field=field,
-        level=level,
-        time=time,
-    )
-    if projection == "flat":
-        return plot_field_flat(
+    _validate_projection(projection)
+    request = _resolve_plot_request(grid, state, field, level, time)
+    if request.grid_only:
+        return _plot_grid(
             grid,
-            arr,
-            field_label,
-            resolved_level,
-            time,
+            projection,
             title=title,
             ax=ax,
-            cmap=cmap,
             edgecolor=edgecolor,
             linewidth=linewidth,
-            vmin=vmin,
-            vmax=vmax,
-            colorbar_label=colorbar_label,
-            contours=contours,
-            contour_color=contour_color,
-            contour_linewidth=contour_linewidth,
         )
-    if projection == "sphere":
-        if ax is not None:
-            raise ValueError("Argument 'ax' is only supported with projection='flat'.")
-        return plot_field_sphere(
-            grid,
-            arr,
-            field_label,
-            resolved_level,
-            time,
-            title=title,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-        )
-    raise ValueError("Argument 'projection' must be 'flat' or 'sphere'.")
+    return _plot_cell_field(
+        grid,
+        request,
+        projection,
+        title=title,
+        ax=ax,
+        cmap=cmap,
+        edgecolor=edgecolor,
+        linewidth=linewidth,
+        vmin=vmin,
+        vmax=vmax,
+        colorbar_label=colorbar_label,
+        contours=contours,
+        contour_color=contour_color,
+        contour_linewidth=contour_linewidth,
+    )
 
 
 def cell_centered_fields(state):
@@ -1622,7 +1804,9 @@ def diagnostic_field_specs(diagnostics_series, fields):
     specs = []
     missing = []
     for field in fields:
-        actual_field = field if field in available_fields else DIAGNOSTIC_FIELD_ALIASES.get(field)
+        actual_field = (
+            field if field in available_fields else DIAGNOSTIC_FIELD_ALIASES.get(field)
+        )
         if actual_field in available_fields:
             specs.append((field, actual_field))
         else:
@@ -1640,7 +1824,9 @@ def plot_diagnostics(diagnostics_series, fields=None, stats=("min", "mean", "max
         stats = [stats]
     invalid_stats = set(stats) - {"min", "mean", "max", "finite_fraction"}
     if invalid_stats:
-        raise ValueError("Argument 'stats' must contain only min, mean, max, or finite_fraction.")
+        raise ValueError(
+            "Argument 'stats' must contain only min, mean, max, or finite_fraction."
+        )
     if not diagnostics_series:
         raise ValueError("No diagnostics have been recorded yet.")
 
@@ -1656,11 +1842,15 @@ def plot_diagnostics(diagnostics_series, fields=None, stats=("min", "mean", "max
         squeeze=False,
     )
     steps = [entry["step"] for entry in diagnostics_series]
-    for axis, (display_field, actual_field) in zip(axes.ravel(), field_specs, strict=True):
+    for axis, (display_field, actual_field) in zip(
+        axes.ravel(), field_specs, strict=True
+    ):
         for stat in stats:
             values = []
             for entry in diagnostics_series:
-                field_rows = [row for row in entry["fields"] if row["field"] == actual_field]
+                field_rows = [
+                    row for row in entry["fields"] if row["field"] == actual_field
+                ]
                 values.append(field_rows[0][stat] if field_rows else np.nan)
             axis.plot(steps, values, label=stat, linewidth=1.5)
         axis.set_xlabel("timestep")
@@ -1671,39 +1861,22 @@ def plot_diagnostics(diagnostics_series, fields=None, stats=("min", "mean", "max
 
 
 __all__ = [
-    "DisplayablePlotlyFigure",
-    "GridRuntime",
-    "StateRuntime",
+    "available_grids",
     "cell_centered_fields",
     "check_config",
-    "clip_polygon_longitude",
     "configure_gt4py_cache",
     "configure_warning_filters",
     "create_grid",
     "create_model",
     "create_state",
     "effective_mesh_size_km",
-    "gridline_sphere_coordinates",
     "init_state",
-    "integrate_driver_steps",
-    "load_plotly_graph_objects",
-    "lonlat_to_unit_sphere",
     "normalize_config",
-    "normalize_polar_vertex_longitudes",
     "parse_icon_grid_name",
     "plot_diagnostics",
     "plot_field",
-    "plot_field_flat",
-    "plot_field_sphere",
-    "plot_grid_flat",
-    "plot_grid_sphere",
     "plot_state",
-    "plotly_color",
-    "require_matching_grid",
-    "select_cell_field",
     "state_field_diagnostics",
     "timestep_stability_limits",
-    "vertical_level_distribution",
     "warn_if_timestep_may_be_unstable",
-    "wrapped_cell_polygons",
 ]
