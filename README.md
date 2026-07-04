@@ -14,6 +14,10 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+The demo installs the local `packages/icon-grid-generator` package in editable
+mode. That package contains only pure Python ICON-style grid generation code;
+the notebook-specific runtime dependencies remain in this demo environment.
+
 Registering the kernel is optional, but it makes the environment easy to select
 inside JupyterLab:
 

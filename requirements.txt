@@ -1,5 +1,7 @@
 -c constraints.txt
 
+-e packages/icon-grid-generator[netcdf,xarray]
+
 # ICON4Py is currently published as a monorepo of namespace subpackages.
 # Installing only the root package from this Git commit lets pip satisfy
 # subpackages from PyPI, whose 0.2.0 wheels are missing APIs used here.

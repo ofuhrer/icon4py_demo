@@ -1,3 +1,10 @@
+"""Pure Python ICON-style geodesic grid generation.
+
+The generator creates a triangular spherical RxxByy grid with the topology,
+metric, orientation, normal-vector, and refinement-provenance fields needed to
+write a compact ICON grid NetCDF file.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -8,12 +15,31 @@ from pathlib import Path
 import platform
 from typing import Any, Mapping
 import re
+import json
 import uuid
 
 import numpy as np
 
+from ._geometry import SphericalIcosahedralGeometry
+from ._io import IconNetcdfWriter
+from ._limited_area import LimitedAreaExtractor
+from ._metrics import SphericalMetricsBuilder
+from ._ordering import FortranOrderingBuilder
+from ._refinement import GlobalRefinementBuilder
+from ._topology import GlobalTopologyBuilder
+from ._torus import (
+    PeriodicTopologyBuilder,
+    PlanarTorusGeometry,
+    PlanarTorusMetricsBuilder,
+    TorusRefinementBuilder,
+)
+from ._validation import finite_float_option, validate_grid_options
+
+IconNetcdfField = tuple[str, tuple[str, ...], Any, dict[str, Any]]
 
 GRID_NAME_RE = re.compile(r"^R0*(\d+)B0*(\d+)$", re.IGNORECASE)
+EARTH_RADIUS_M = 6_371_229.0
+POINT_MATCH_DECIMALS = 12
 XYZ_LABELS = np.array(["x", "y", "z"])
 CELL_VERTEX_LABELS = np.array([0, 1, 2], dtype=np.int32)
 EDGE_VERTEX_LABELS = np.array([0, 1], dtype=np.int32)
@@ -28,6 +54,20 @@ FIXED_DIMS = {
     "edge_grf": 24,
     "vert_grf": 13,
 }
+ACTIVE_REFINEMENT_START = {
+    "cell_grf": 9,
+    "edge_grf": 14,
+    "vert_grf": 8,
+}
+CHILD_CELL_TYPE_CENTER = 200
+CHILD_CELL_TYPE_AT_VERTEX_0 = 201
+CHILD_CELL_TYPE_AT_VERTEX_1 = 202
+CHILD_CELL_TYPE_AT_VERTEX_2 = 203
+EDGE_CHILD_TYPE_FROM_VERTEX_0 = 101
+EDGE_CHILD_TYPE_FROM_VERTEX_1 = 102
+EDGE_CHILD_TYPE_IN_CELL_OPPOSITE_VERTEX_0 = 201
+EDGE_CHILD_TYPE_IN_CELL_OPPOSITE_VERTEX_1 = 202
+EDGE_CHILD_TYPE_IN_CELL_OPPOSITE_VERTEX_2 = 203
 CELL_COORD_ATTRS = {
     "coordinates": "clon clat",
     "grid_type": "unstructured",
@@ -221,8 +261,8 @@ ICON_VARIABLE_ATTRS: dict[str, dict[str, Any]] = {
 
 
 @dataclass(frozen=True)
-class GridSpec:
-    """Normalized RxxByy grid specification."""
+class IconGridSpec:
+    """Normalized ICON RxxByy grid specification."""
 
     root: int
     bisections: int
@@ -243,21 +283,110 @@ class GridSpec:
 
 
 @dataclass(frozen=True)
-class GridOptions:
-    """Options for pure Python grid generation."""
+class TorusGridSpec:
+    """Planar triangular torus grid specification."""
 
-    max_cells: int | None = 1_000_000
-    radius: float = 1.0
-    sphere_radius: float = 6_371_229.0
-    include_edges: bool = True
+    nx: int
+    ny: int
+    edge_length: float
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.nx, int) or isinstance(self.nx, bool) or self.nx < 3:
+            raise ValueError("torus nx must be an integer greater than or equal to 3")
+        if not isinstance(self.ny, int) or isinstance(self.ny, bool) or self.ny < 3:
+            raise ValueError("torus ny must be an integer greater than or equal to 3")
+        edge_length = _finite_float_option("edge_length", self.edge_length)
+        if edge_length <= 0.0:
+            raise ValueError("edge_length must be positive")
+        if not self.name:
+            object.__setattr__(self, "name", f"TORUS{self.nx}x{self.ny}")
+
+    @property
+    def expected_cells(self) -> int:
+        return 2 * self.nx * self.ny
+
+    @property
+    def expected_edges(self) -> int:
+        return 3 * self.nx * self.ny
+
+    @property
+    def expected_vertices(self) -> int:
+        return self.nx * self.ny
+
+    @property
+    def domain_length(self) -> float:
+        return self.nx * self.edge_length
+
+    @property
+    def domain_height(self) -> float:
+        return self.ny * np.sqrt(3.0) * 0.5 * self.edge_length
 
 
 @dataclass(frozen=True)
-class GeneratedGrid:
-    """Lightweight generated grid geometry and topology."""
+class LimitedAreaSpec:
+    """Limited-area grid extracted from a generated global parent grid."""
 
-    spec: GridSpec
-    options: GridOptions
+    parent_grid_name: str
+    lon_min: float
+    lon_max: float
+    lat_min: float
+    lat_max: float
+    boundary_depth: int = 0
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        parent = parse_grid_spec(self.parent_grid_name)
+        lon_min = _finite_float_option("lon_min", self.lon_min)
+        lon_max = _finite_float_option("lon_max", self.lon_max)
+        lat_min = _finite_float_option("lat_min", self.lat_min)
+        lat_max = _finite_float_option("lat_max", self.lat_max)
+        if not -180.0 <= lon_min <= 180.0:
+            raise ValueError("lon_min must be within [-180, 180]")
+        if not -180.0 <= lon_max <= 180.0:
+            raise ValueError("lon_max must be within [-180, 180]")
+        if not -90.0 <= lat_min <= 90.0 or not -90.0 <= lat_max <= 90.0:
+            raise ValueError("lat bounds must be within [-90, 90]")
+        if lat_min > lat_max:
+            raise ValueError("lat_min must be less than or equal to lat_max")
+        if not isinstance(self.boundary_depth, int) or isinstance(self.boundary_depth, bool):
+            raise TypeError("boundary_depth must be a non-negative integer")
+        if self.boundary_depth < 0:
+            raise ValueError("boundary_depth must be non-negative")
+        object.__setattr__(self, "parent_grid_name", parent.name)
+        if not self.name:
+            object.__setattr__(self, "name", f"LAM_{parent.name}")
+
+    @property
+    def expected_cells(self) -> int:
+        return 0
+
+    @property
+    def expected_edges(self) -> int:
+        return 0
+
+    @property
+    def expected_vertices(self) -> int:
+        return 0
+
+
+@dataclass(frozen=True)
+class IconGridOptions:
+    """Options for pure Python ICON grid generation."""
+
+    max_cells: int | None = 1_000_000
+    radius: float = 1.0
+    sphere_radius: float = EARTH_RADIUS_M
+    rotation_axis: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    rotation_angle_degrees: float = 0.0
+
+
+@dataclass(frozen=True)
+class IconGrid:
+    """ICON grid geometry, topology, metrics, and NetCDF export support."""
+
+    spec: IconGridSpec | TorusGridSpec | LimitedAreaSpec
+    options: IconGridOptions
     vertices: np.ndarray
     cells: np.ndarray
     lon: np.ndarray
@@ -267,16 +396,17 @@ class GeneratedGrid:
     cell_center_xyz: np.ndarray
     cell_vertex_lon: np.ndarray
     cell_vertex_lat: np.ndarray
-    edges: np.ndarray | None = None
-    cell_edges: np.ndarray | None = None
-    edge_cells: np.ndarray | None = None
-    edge_center_xyz: np.ndarray | None = None
-    edge_lon: np.ndarray | None = None
-    edge_lat: np.ndarray | None = None
+    edges: np.ndarray
+    cell_edges: np.ndarray
+    edge_cells: np.ndarray
+    edge_center_xyz: np.ndarray
+    edge_lon: np.ndarray
+    edge_lat: np.ndarray
     icon_connectivity: dict[str, np.ndarray] = field(default_factory=dict)
     connectivity: dict[str, np.ndarray] = field(default_factory=dict)
     neighbor_tables: dict[str, np.ndarray] = field(default_factory=dict)
     geometry: dict[str, np.ndarray] = field(default_factory=dict)
+    refinement: dict[str, np.ndarray] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -288,9 +418,8 @@ class GeneratedGrid:
         dims = {
             "cell": int(self.cells.shape[0]),
             "vertex": int(self.vertices.shape[0]),
+            "edge": int(self.edges.shape[0]),
         }
-        if self.edges is not None:
-            dims["edge"] = int(self.edges.shape[0])
         return dims
 
     def to_dict(self) -> dict[str, Any]:
@@ -310,24 +439,20 @@ class GeneratedGrid:
             "cell_vertex_lon": self.cell_vertex_lon,
             "cell_vertex_lat": self.cell_vertex_lat,
         }
-        if self.edges is not None:
-            data["edges"] = self.edges
-        if self.cell_edges is not None:
-            data["cell_edges"] = self.cell_edges
-        if self.edge_cells is not None:
-            data["edge_cells"] = self.edge_cells
-        if self.edge_center_xyz is not None:
-            data["edge_center_xyz"] = self.edge_center_xyz
-        if self.edge_lon is not None:
-            data["edge_lon"] = self.edge_lon
-        if self.edge_lat is not None:
-            data["edge_lat"] = self.edge_lat
+        data["edges"] = self.edges
+        data["cell_edges"] = self.cell_edges
+        data["edge_cells"] = self.edge_cells
+        data["edge_center_xyz"] = self.edge_center_xyz
+        data["edge_lon"] = self.edge_lon
+        data["edge_lat"] = self.edge_lat
         if self.connectivity:
             data["connectivity"] = self.connectivity
         if self.neighbor_tables:
             data["neighbor_tables"] = self.neighbor_tables
         if self.geometry:
             data["geometry"] = self.geometry
+        if self.refinement:
+            data["refinement"] = self.refinement
         if self.metadata:
             data["metadata"] = self.metadata
         return data
@@ -351,67 +476,71 @@ class GeneratedGrid:
             "xyz": XYZ_LABELS,
             "cell_vertex": CELL_VERTEX_LABELS,
         }
-        if self.edges is not None:
-            data_vars["edges"] = (("edge", "edge_vertex"), self.edges)
-            coords["edge_vertex"] = EDGE_VERTEX_LABELS
-        if self.cell_edges is not None:
-            data_vars["cell_edges"] = (("cell", "cell_vertex"), self.cell_edges)
-        if self.edge_cells is not None:
-            data_vars["edge_cells"] = (("edge", "edge_cell"), self.edge_cells)
-            coords["edge_cell"] = EDGE_CELL_LABELS
-        if self.edge_center_xyz is not None:
-            data_vars["edge_center_xyz"] = (("edge", "xyz"), self.edge_center_xyz)
-        if self.edge_lon is not None:
-            data_vars["edge_lon"] = (("edge",), self.edge_lon)
-        if self.edge_lat is not None:
-            data_vars["edge_lat"] = (("edge",), self.edge_lat)
+        data_vars["edges"] = (("edge", "edge_vertex"), self.edges)
+        data_vars["cell_edges"] = (("cell", "cell_vertex"), self.cell_edges)
+        data_vars["edge_cells"] = (("edge", "edge_cell"), self.edge_cells)
+        data_vars["edge_center_xyz"] = (("edge", "xyz"), self.edge_center_xyz)
+        data_vars["edge_lon"] = (("edge",), self.edge_lon)
+        data_vars["edge_lat"] = (("edge",), self.edge_lat)
+        coords["edge_vertex"] = EDGE_VERTEX_LABELS
+        coords["edge_cell"] = EDGE_CELL_LABELS
 
         return xr.Dataset(
             data_vars=data_vars,
             coords=coords,
             attrs={
                 "name": self.name,
-                "root": self.spec.root,
-                "bisections": self.spec.bisections,
-                "frequency": self.spec.frequency,
+                "root": getattr(self.spec, "root", 0),
+                "bisections": getattr(self.spec, "bisections", 0),
+                "frequency": getattr(self.spec, "frequency", 0),
                 "radius": self.options.radius,
             },
         )
 
-    def to_netcdf(self, path: str | Any, *, sphere_radius: float = 6_371_229.0) -> Any:
-        """Write an ICON-style NetCDF grid file readable by ICON4Py GridManager."""
-        return write_icon_grid(self, path, sphere_radius=sphere_radius)
+    def to_netcdf(self, path: str | Any, *, sphere_radius: float | None = None) -> Any:
+        """Write an ICON-style NetCDF grid file."""
+        return IconNetcdfWriter().write(self, path, sphere_radius=sphere_radius)
 
 
 def generate_grid(
-    grid_name: str,
-    options: GridOptions | Mapping[str, Any] | None = None,
-) -> GeneratedGrid:
-    """Create a pure Python geodesic RxxByy grid."""
-    spec = parse_grid_spec(grid_name)
+    grid_name: str | IconGridSpec | TorusGridSpec | LimitedAreaSpec,
+    options: IconGridOptions | Mapping[str, Any] | None = None,
+) -> IconGrid:
+    """Create a pure Python ICON geodesic, torus, or limited-area grid."""
+    spec = parse_grid_spec(grid_name) if isinstance(grid_name, str) else grid_name
+    if not isinstance(spec, (IconGridSpec, TorusGridSpec, LimitedAreaSpec)):
+        raise TypeError("grid_name must be an RxxByy string or a supported grid spec")
     resolved_options = _resolve_options(options)
-    if resolved_options.radius <= 0:
-        raise ValueError("radius must be positive")
-    if resolved_options.sphere_radius <= 0:
-        raise ValueError("sphere_radius must be positive")
-    if resolved_options.max_cells is not None and spec.expected_cells > resolved_options.max_cells:
-        raise ValueError(
-            f"{spec.name} has {spec.expected_cells} cells, exceeding max_cells="
-            f"{resolved_options.max_cells}"
-        )
+    _validate_options(spec, resolved_options)
 
+    if isinstance(spec, TorusGridSpec):
+        return _generate_torus_grid(spec, resolved_options)
+    if isinstance(spec, LimitedAreaSpec):
+        return _generate_limited_area_grid(spec, resolved_options)
     return _generate_grid(spec, resolved_options)
 
 
-def write_icon_grid(
-    grid: GeneratedGrid,
+def _validate_options(
+    spec: IconGridSpec | TorusGridSpec | LimitedAreaSpec,
+    options: IconGridOptions,
+) -> None:
+    validate_grid_options(spec, options)
+
+
+def _finite_float_option(name: str, value: Any) -> float:
+    return finite_float_option(name, value)
+
+
+def _write_icon_grid(
+    grid: IconGrid,
     path: str | Path,
     *,
-    sphere_radius: float = 6_371_229.0,
+    sphere_radius: float | None = None,
 ) -> Path:
-    """Write a compact ICON-style NetCDF grid file for ICON4Py's GridManager."""
-    if grid.edges is None or grid.cell_edges is None or grid.edge_cells is None:
-        raise ValueError("ICON NetCDF export requires grid edges; use include_edges=True")
+    """Write a compact ICON-style NetCDF grid file."""
+    _require_complete_icon_grid(grid)
+    if sphere_radius is None:
+        sphere_radius = grid.options.sphere_radius
     if not np.isclose(sphere_radius, grid.options.sphere_radius):
         raise ValueError(
             "sphere_radius must match the value used by generate_grid(); "
@@ -438,8 +567,22 @@ def write_icon_grid(
     return path
 
 
-def parse_grid_spec(grid_name: str) -> GridSpec:
+def _require_complete_icon_grid(grid: IconGrid) -> None:
+    for name, fields in {
+        "icon_connectivity": grid.icon_connectivity,
+        "geometry": grid.geometry,
+        "refinement": grid.refinement,
+    }.items():
+        if not fields:
+            raise ValueError(f"ICON NetCDF export requires populated {name}")
+
+
+def parse_grid_spec(
+    grid_name: str | IconGridSpec | TorusGridSpec | LimitedAreaSpec,
+) -> IconGridSpec | TorusGridSpec | LimitedAreaSpec:
     """Parse and normalize an RxxByy grid name."""
+    if isinstance(grid_name, (IconGridSpec, TorusGridSpec, LimitedAreaSpec)):
+        return grid_name
     if not isinstance(grid_name, str):
         raise TypeError("grid_name must be a string such as 'R02B03'")
 
@@ -455,7 +598,7 @@ def parse_grid_spec(grid_name: str) -> GridSpec:
         raise ValueError("grid bisections must be non-negative")
 
     frequency = root * 2**bisections
-    return GridSpec(
+    return IconGridSpec(
         root=root,
         bisections=bisections,
         frequency=frequency,
@@ -463,106 +606,116 @@ def parse_grid_spec(grid_name: str) -> GridSpec:
     )
 
 
-def _resolve_options(options: GridOptions | Mapping[str, Any] | None) -> GridOptions:
+def _resolve_options(options: IconGridOptions | Mapping[str, Any] | None) -> IconGridOptions:
     if options is None:
-        return GridOptions()
-    if isinstance(options, GridOptions):
+        return IconGridOptions()
+    if isinstance(options, IconGridOptions):
         return options
     if not isinstance(options, Mapping):
-        raise TypeError("options must be None, a GridOptions instance, or a mapping")
+        raise TypeError("options must be None, an IconGridOptions instance, or a mapping")
 
-    allowed = set(GridOptions.__dataclass_fields__)
+    allowed = set(IconGridOptions.__dataclass_fields__)
     unknown = set(options) - allowed
     if unknown:
         names = ", ".join(sorted(unknown))
         raise TypeError(f"unknown grid option(s): {names}")
-    return GridOptions(**dict(options))
+    return IconGridOptions(**dict(options))
 
 
-def _generate_grid(spec: GridSpec, options: GridOptions) -> GeneratedGrid:
-    base_vertices, faces = _icosahedron()
-    vertex_array = base_vertices
-    cell_array = np.asarray(
-        [_orient_cell(tuple(face), vertex_array) for face in faces],
-        dtype=np.int32,
-    )
-    if spec.root > 1:
-        vertex_array, cell_array = _refine_triangles(vertex_array, cell_array, spec.root)
-    for _ in range(spec.bisections):
-        vertex_array, cell_array = _refine_triangles(vertex_array, cell_array, 2)
+def _generate_grid(spec: IconGridSpec, options: IconGridOptions) -> IconGrid:
+    geometry = SphericalIcosahedralGeometry().build(spec, options)
+    geometry = FortranOrderingBuilder().order_spherical_bisection(spec, options, geometry)
+    topology = GlobalTopologyBuilder().build(spec, options, geometry)
+    metrics = SphericalMetricsBuilder().build(options, geometry, topology)
+    refinement = GlobalRefinementBuilder().build(spec, options, geometry, topology)
+    metadata = _metadata(spec, options, metrics.fields)
 
-    vertex_array = vertex_array * options.radius
-    _check_expected_counts(spec, vertex_array, cell_array)
-
-    vertex_lon, vertex_lat = _lon_lat(vertex_array)
-    cell_center_xyz = _cell_centers(vertex_array, cell_array, options.radius)
-    lon, lat = _lon_lat(cell_center_xyz)
-    cell_vertex_lon = vertex_lon[cell_array]
-    cell_vertex_lat = vertex_lat[cell_array]
-
-    edges = None
-    cell_edges = None
-    edge_cells = None
-    edge_center_xyz = None
-    edge_lon = None
-    edge_lat = None
-    icon_connectivity: dict[str, np.ndarray] = {}
-    connectivity: dict[str, np.ndarray] = {}
-    neighbor_tables: dict[str, np.ndarray] = {}
-    geometry: dict[str, np.ndarray] = {}
-    metadata = _metadata(spec, options)
-    if options.include_edges:
-        edges, cell_edges, edge_cells = _build_edges(cell_array)
-        if edges.shape[0] != spec.expected_edges:
-            raise RuntimeError(
-                f"generated {edges.shape[0]} edges, expected {spec.expected_edges}"
-            )
-        edge_center_xyz = _edge_centers(vertex_array, edges, options.radius)
-        edge_lon, edge_lat = _lon_lat(edge_center_xyz)
-        icon_connectivity = _icon_connectivity(
-            vertex_array,
-            cell_array,
-            cell_center_xyz,
-            edges,
-            cell_edges,
-            edge_cells,
-        )
-        connectivity = _public_connectivity(cell_array, edges, edge_cells, icon_connectivity)
-        neighbor_tables = _neighbor_tables(cell_array, edges, edge_cells, icon_connectivity)
-        geometry = _geometry_fields(
-            vertex_array,
-            cell_array,
-            cell_center_xyz,
-            edges,
-            edge_cells,
-            edge_center_xyz,
-            icon_connectivity,
-            options.sphere_radius,
-        )
-        metadata = _metadata(spec, options, geometry)
-
-    return GeneratedGrid(
+    return IconGrid(
         spec=spec,
         options=options,
-        vertices=vertex_array,
-        cells=cell_array,
-        lon=lon,
-        lat=lat,
-        vertex_lon=vertex_lon,
-        vertex_lat=vertex_lat,
-        cell_center_xyz=cell_center_xyz,
-        cell_vertex_lon=cell_vertex_lon,
-        cell_vertex_lat=cell_vertex_lat,
-        edges=edges,
-        cell_edges=cell_edges,
-        edge_cells=edge_cells,
-        edge_center_xyz=edge_center_xyz,
-        edge_lon=edge_lon,
-        edge_lat=edge_lat,
-        icon_connectivity=icon_connectivity,
-        connectivity=connectivity,
-        neighbor_tables=neighbor_tables,
-        geometry=geometry,
+        vertices=geometry.vertices,
+        cells=geometry.cells,
+        lon=geometry.lon,
+        lat=geometry.lat,
+        vertex_lon=geometry.vertex_lon,
+        vertex_lat=geometry.vertex_lat,
+        cell_center_xyz=geometry.cell_center_xyz,
+        cell_vertex_lon=geometry.cell_vertex_lon,
+        cell_vertex_lat=geometry.cell_vertex_lat,
+        edges=topology.edges,
+        cell_edges=topology.cell_edges,
+        edge_cells=topology.edge_cells,
+        edge_center_xyz=topology.edge_center_xyz,
+        edge_lon=topology.edge_lon,
+        edge_lat=topology.edge_lat,
+        icon_connectivity=topology.icon_connectivity,
+        connectivity=topology.connectivity,
+        neighbor_tables=topology.neighbor_tables,
+        geometry=metrics.fields,
+        refinement=refinement.fields,
+        metadata=metadata,
+    )
+
+
+def _generate_torus_grid(spec: TorusGridSpec, options: IconGridOptions) -> IconGrid:
+    geometry = PlanarTorusGeometry().build(spec, options)
+    topology = PeriodicTopologyBuilder().build(spec, options, geometry)
+    metrics = PlanarTorusMetricsBuilder().build(spec, geometry, topology)
+    refinement = TorusRefinementBuilder().build(geometry, topology)
+    metadata = _metadata(spec, options, metrics.fields)
+    return IconGrid(
+        spec=spec,
+        options=options,
+        vertices=geometry.vertices,
+        cells=geometry.cells,
+        lon=geometry.lon,
+        lat=geometry.lat,
+        vertex_lon=geometry.vertex_lon,
+        vertex_lat=geometry.vertex_lat,
+        cell_center_xyz=geometry.cell_center_xyz,
+        cell_vertex_lon=geometry.cell_vertex_lon,
+        cell_vertex_lat=geometry.cell_vertex_lat,
+        edges=topology.edges,
+        cell_edges=topology.cell_edges,
+        edge_cells=topology.edge_cells,
+        edge_center_xyz=topology.edge_center_xyz,
+        edge_lon=topology.edge_lon,
+        edge_lat=topology.edge_lat,
+        icon_connectivity=topology.icon_connectivity,
+        connectivity=topology.connectivity,
+        neighbor_tables=topology.neighbor_tables,
+        geometry=metrics.fields,
+        refinement=refinement.fields,
+        metadata=metadata,
+    )
+
+
+def _generate_limited_area_grid(spec: LimitedAreaSpec, options: IconGridOptions) -> IconGrid:
+    geometry, topology, metrics, refinement = LimitedAreaExtractor().build(spec, options)
+    metadata = _metadata(spec, options, metrics.fields)
+    return IconGrid(
+        spec=spec,
+        options=options,
+        vertices=geometry.vertices,
+        cells=geometry.cells,
+        lon=geometry.lon,
+        lat=geometry.lat,
+        vertex_lon=geometry.vertex_lon,
+        vertex_lat=geometry.vertex_lat,
+        cell_center_xyz=geometry.cell_center_xyz,
+        cell_vertex_lon=geometry.cell_vertex_lon,
+        cell_vertex_lat=geometry.cell_vertex_lat,
+        edges=topology.edges,
+        cell_edges=topology.cell_edges,
+        edge_cells=topology.edge_cells,
+        edge_center_xyz=topology.edge_center_xyz,
+        edge_lon=topology.edge_lon,
+        edge_lat=topology.edge_lat,
+        icon_connectivity=topology.icon_connectivity,
+        connectivity=topology.connectivity,
+        neighbor_tables=topology.neighbor_tables,
+        geometry=metrics.fields,
+        refinement=refinement.fields,
         metadata=metadata,
     )
 
@@ -623,7 +776,29 @@ def _normalize(point: np.ndarray) -> np.ndarray:
 
 
 def _normalize_rows(points: np.ndarray) -> np.ndarray:
-    return points / np.linalg.norm(points, axis=1)[:, np.newaxis]
+    norms = np.linalg.norm(points, axis=1)
+    if np.any(norms == 0.0):
+        raise RuntimeError("cannot normalize zero-length grid point rows")
+    return points / norms[:, np.newaxis]
+
+
+def _rotate_points(
+    points: np.ndarray,
+    axis: tuple[float, float, float],
+    angle_degrees: float,
+) -> np.ndarray:
+    """Rotate Cartesian sphere points around `axis` by `angle_degrees`."""
+    if angle_degrees == 0.0:
+        return points.copy()
+    rotation_axis = np.asarray(axis, dtype=np.float64)
+    rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+    angle = np.radians(angle_degrees)
+    cos_angle = np.cos(angle)
+    sin_angle = np.sin(angle)
+    cross = np.cross(rotation_axis, points)
+    projection = np.sum(points * rotation_axis, axis=1)[:, np.newaxis] * rotation_axis
+    rotated = points * cos_angle + cross * sin_angle + projection * (1.0 - cos_angle)
+    return _normalize_rows(rotated)
 
 
 def _orient_cell(cell: tuple[int, int, int], vertices: Any) -> tuple[int, int, int]:
@@ -726,7 +901,7 @@ def _refine_triangles(
     )
 
 
-def _check_expected_counts(spec: GridSpec, vertices: np.ndarray, cells: np.ndarray) -> None:
+def _check_expected_counts(spec: IconGridSpec, vertices: np.ndarray, cells: np.ndarray) -> None:
     if cells.shape[0] != spec.expected_cells:
         raise RuntimeError(f"generated {cells.shape[0]} cells, expected {spec.expected_cells}")
     if vertices.shape[0] != spec.expected_vertices:
@@ -789,7 +964,7 @@ def _build_edges(cells: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     )
 
 
-def _write_icon_dimensions(dataset: Any, grid: GeneratedGrid) -> None:
+def _write_icon_dimensions(dataset: Any, grid: IconGrid) -> None:
     dataset.createDimension("cell", grid.dims["cell"])
     dataset.createDimension("vertex", grid.dims["vertex"])
     dataset.createDimension("edge", grid.dims["edge"])
@@ -797,10 +972,10 @@ def _write_icon_dimensions(dataset: Any, grid: GeneratedGrid) -> None:
         dataset.createDimension(name, size)
 
 
-def _write_icon_attributes(dataset: Any, grid: GeneratedGrid, path: Path) -> None:
+def _write_icon_attributes(dataset: Any, grid: IconGrid, path: Path) -> None:
     external_attrs = {
         "revision": "pure-python",
-        "history": f"write_icon_grid {path}",
+        "history": f"grid.to_netcdf {path}",
         "date": datetime.now().strftime("%Y%m%d at %H%M%S"),
         "user_name": getpass.getuser(),
         "os_name": platform.platform(),
@@ -811,14 +986,20 @@ def _write_icon_attributes(dataset: Any, grid: GeneratedGrid, path: Path) -> Non
         "max_childdom": 1,
         "boundary_depth_index": 0,
         "rotation_vector": np.zeros(3, dtype=np.float64),
-        "domain_length": 2.0 * np.pi * grid.options.sphere_radius,
-        "domain_height": 2.0 * np.pi * grid.options.sphere_radius,
+        "domain_length": grid.metadata.get(
+            "domain_length",
+            2.0 * np.pi * grid.options.sphere_radius,
+        ),
+        "domain_height": grid.metadata.get(
+            "domain_height",
+            2.0 * np.pi * grid.options.sphere_radius,
+        ),
         "domain_cartesian_center": np.zeros(3, dtype=np.float64),
     }
     attrs = {
         "title": f"Pure Python ICON grid {grid.name}",
-        "institution": "icon4py_demo",
-        "source": "grid_generator Python RxxByy generator",
+        "institution": "grid_generator",
+        "source": "grid_generator Python ICON grid generator",
         "ICON_grid_file_uri": str(path),
         **external_attrs,
         **grid.metadata,
@@ -827,17 +1008,26 @@ def _write_icon_attributes(dataset: Any, grid: GeneratedGrid, path: Path) -> Non
         dataset.setncattr(name, value)
 
 
-def _icon_fields(grid: GeneratedGrid) -> list[tuple[str, tuple[str, ...], Any, dict[str, str]]]:
-    connectivity = grid.icon_connectivity
-    geometry = grid.geometry
-    unit_vertices = _normalize_rows(grid.vertices)
-    unit_centers = _normalize_rows(grid.cell_center_xyz)
-    unit_edge_centers = _normalize_rows(grid.edge_center_xyz)
-    edge_bounds_lon, edge_bounds_lat = _edge_lon_lat_bounds(grid)
-    zeros_cell = np.zeros(grid.dims["cell"], dtype=np.float64)
-    zeros_edge = np.zeros(grid.dims["edge"], dtype=np.float64)
+def _icon_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    fields = (
+        _coordinate_fields(grid)
+        + _connectivity_fields(grid)
+        + _metric_fields(grid)
+        + _refinement_fields_for_netcdf(grid)
+        + _static_surface_fields(grid)
+        + _cartesian_fields(grid)
+        + _normal_vector_fields(grid)
+        + _hierarchy_fields(grid)
+    )
+    return [
+        (name, dims, data, _with_icon_variable_attrs(name, attrs))
+        for name, dims, data, attrs in fields
+    ]
 
-    fields = [
+
+def _coordinate_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    edge_bounds_lon, edge_bounds_lat = _edge_lon_lat_bounds(grid)
+    return [
         ("clon", ("cell",), np.radians(grid.lon), {"units": "radian"}),
         ("clat", ("cell",), np.radians(grid.lat), {"units": "radian"}),
         ("clon_vertices", ("cell", "nv"), np.radians(grid.cell_vertex_lon), {"units": "radian"}),
@@ -854,6 +1044,12 @@ def _icon_fields(grid: GeneratedGrid) -> list[tuple[str, tuple[str, ...], Any, d
         ("latitude_vertices", ("vertex",), np.radians(grid.vertex_lat), {"units": "radian"}),
         ("lon_edge_centre", ("edge",), np.radians(grid.edge_lon), {"units": "radian"}),
         ("lat_edge_centre", ("edge",), np.radians(grid.edge_lat), {"units": "radian"}),
+    ]
+
+
+def _connectivity_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    connectivity = grid.icon_connectivity
+    return [
         ("edge_of_cell", ("nv", "cell"), connectivity["c2e"].T + 1, {}),
         ("vertex_of_cell", ("nv", "cell"), grid.cells.T + 1, {}),
         ("neighbor_cell_index", ("nv", "cell"), connectivity["c2c"].T + 1, {}),
@@ -862,6 +1058,15 @@ def _icon_fields(grid: GeneratedGrid) -> list[tuple[str, tuple[str, ...], Any, d
         ("cells_of_vertex", ("ne", "vertex"), connectivity["v2c"].T, {}),
         ("edges_of_vertex", ("ne", "vertex"), connectivity["v2e"].T, {}),
         ("vertices_of_vertex", ("ne", "vertex"), connectivity["v2v"].T, {}),
+    ]
+
+
+def _metric_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    geometry = grid.geometry
+    edgequad_normalizer = (
+        1.0 if grid.metadata.get("grid_geometry") == 2 else grid.options.sphere_radius**2
+    )
+    return [
         ("cell_area", ("cell",), geometry["cell_area"], {"units": "m2"}),
         ("dual_area", ("vertex",), geometry["dual_area"], {"units": "m2"}),
         ("cell_area_p", ("cell",), geometry["cell_area"], {"units": "m2"}),
@@ -873,25 +1078,51 @@ def _icon_fields(grid: GeneratedGrid) -> list[tuple[str, tuple[str, ...], Any, d
         (
             "edgequad_area",
             ("edge",),
-            geometry["edgequad_area"] / grid.options.sphere_radius**2,
+            geometry["edgequad_area"] / edgequad_normalizer,
             {"units": "m2"},
         ),
         ("orientation_of_normal", ("nv", "cell"), geometry["orientation_of_normal"].T, {}),
         ("edge_system_orientation", ("edge",), geometry["edge_system_orientation"], {}),
         ("edge_orientation", ("ne", "vertex"), geometry["edge_orientation"].T, {}),
-        ("refin_c_ctrl", ("cell",), np.full(grid.dims["cell"], -4, dtype=np.int32), {}),
-        ("refin_e_ctrl", ("edge",), np.full(grid.dims["edge"], -8, dtype=np.int32), {}),
-        ("refin_v_ctrl", ("vertex",), np.zeros(grid.dims["vertex"], dtype=np.int32), {}),
-        ("start_idx_c", ("max_chdom", "cell_grf"), _zeros_fixed("cell_grf"), {}),
-        ("end_idx_c", ("max_chdom", "cell_grf"), _zeros_fixed("cell_grf"), {}),
-        ("start_idx_e", ("max_chdom", "edge_grf"), _zeros_fixed("edge_grf"), {}),
-        ("end_idx_e", ("max_chdom", "edge_grf"), _zeros_fixed("edge_grf"), {}),
-        ("start_idx_v", ("max_chdom", "vert_grf"), _zeros_fixed("vert_grf"), {}),
-        ("end_idx_v", ("max_chdom", "vert_grf"), _zeros_fixed("vert_grf"), {}),
+    ]
+
+
+def _refinement_fields_for_netcdf(grid: IconGrid) -> list[IconNetcdfField]:
+    refinement = grid.refinement
+    return [
+        ("refin_c_ctrl", ("cell",), refinement["refin_c_ctrl"], {}),
+        ("refin_e_ctrl", ("edge",), refinement["refin_e_ctrl"], {}),
+        ("refin_v_ctrl", ("vertex",), refinement["refin_v_ctrl"], {}),
+        ("start_idx_c", ("max_chdom", "cell_grf"), refinement["start_idx_c"], {}),
+        ("end_idx_c", ("max_chdom", "cell_grf"), refinement["end_idx_c"], {}),
+        ("start_idx_e", ("max_chdom", "edge_grf"), refinement["start_idx_e"], {}),
+        ("end_idx_e", ("max_chdom", "edge_grf"), refinement["end_idx_e"], {}),
+        ("start_idx_v", ("max_chdom", "vert_grf"), refinement["start_idx_v"], {}),
+        ("end_idx_v", ("max_chdom", "vert_grf"), refinement["end_idx_v"], {}),
+    ]
+
+
+def _static_surface_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    zeros_cell = np.zeros(grid.dims["cell"], dtype=np.float64)
+    zeros_edge = np.zeros(grid.dims["edge"], dtype=np.float64)
+    return [
         ("cell_elevation", ("cell",), zeros_cell, {"units": "m"}),
         ("edge_elevation", ("edge",), zeros_edge, {"units": "m"}),
         ("cell_sea_land_mask", ("cell",), np.zeros(grid.dims["cell"], dtype=np.int32), {}),
         ("edge_sea_land_mask", ("edge",), np.zeros(grid.dims["edge"], dtype=np.int32), {}),
+    ]
+
+
+def _cartesian_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    if grid.metadata.get("grid_geometry") == 2:
+        unit_vertices = grid.vertices
+        unit_centers = grid.cell_center_xyz
+        unit_edge_centers = grid.edge_center_xyz
+    else:
+        unit_vertices = _normalize_rows(grid.vertices)
+        unit_centers = _normalize_rows(grid.cell_center_xyz)
+        unit_edge_centers = _normalize_rows(grid.edge_center_xyz)
+    return [
         ("cartesian_x_vertices", ("vertex",), unit_vertices[:, 0], {"units": "meters"}),
         ("cartesian_y_vertices", ("vertex",), unit_vertices[:, 1], {"units": "meters"}),
         ("cartesian_z_vertices", ("vertex",), unit_vertices[:, 2], {"units": "meters"}),
@@ -909,27 +1140,78 @@ def _icon_fields(grid: GeneratedGrid) -> list[tuple[str, tuple[str, ...], Any, d
         ("edge_dual_middle_cartesian_x", ("edge",), unit_edge_centers[:, 0], {"units": "meters"}),
         ("edge_dual_middle_cartesian_y", ("edge",), unit_edge_centers[:, 1], {"units": "meters"}),
         ("edge_dual_middle_cartesian_z", ("edge",), unit_edge_centers[:, 2], {"units": "meters"}),
-        ("edge_primal_normal_cartesian_x", ("edge",), zeros_edge, {"units": "meters"}),
-        ("edge_primal_normal_cartesian_y", ("edge",), zeros_edge, {"units": "meters"}),
-        ("edge_primal_normal_cartesian_z", ("edge",), zeros_edge, {"units": "meters"}),
-        ("edge_dual_normal_cartesian_x", ("edge",), zeros_edge, {"units": "meters"}),
-        ("edge_dual_normal_cartesian_y", ("edge",), zeros_edge, {"units": "meters"}),
-        ("edge_dual_normal_cartesian_z", ("edge",), zeros_edge, {"units": "meters"}),
-        ("zonal_normal_primal_edge", ("edge",), zeros_edge, {"units": "radian"}),
-        ("meridional_normal_primal_edge", ("edge",), zeros_edge, {"units": "radian"}),
-        ("zonal_normal_dual_edge", ("edge",), zeros_edge, {"units": "radian"}),
-        ("meridional_normal_dual_edge", ("edge",), zeros_edge, {"units": "radian"}),
-        ("parent_cell_index", ("cell",), np.zeros(grid.dims["cell"], dtype=np.int32), {}),
-        ("parent_cell_type", ("cell",), np.zeros(grid.dims["cell"], dtype=np.int32), {}),
-        ("edge_parent_type", ("edge",), np.zeros(grid.dims["edge"], dtype=np.int32), {}),
-        ("parent_edge_index", ("edge",), np.zeros(grid.dims["edge"], dtype=np.int32), {}),
-        ("parent_vertex_index", ("vertex",), np.zeros(grid.dims["vertex"], dtype=np.int32), {}),
+    ]
+
+
+def _normal_vector_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    geometry = grid.geometry
+    return [
+        (
+            "edge_primal_normal_cartesian_x",
+            ("edge",),
+            geometry["edge_primal_normal_cartesian"][:, 0],
+            {"units": "meters"},
+        ),
+        (
+            "edge_primal_normal_cartesian_y",
+            ("edge",),
+            geometry["edge_primal_normal_cartesian"][:, 1],
+            {"units": "meters"},
+        ),
+        (
+            "edge_primal_normal_cartesian_z",
+            ("edge",),
+            geometry["edge_primal_normal_cartesian"][:, 2],
+            {"units": "meters"},
+        ),
+        (
+            "edge_dual_normal_cartesian_x",
+            ("edge",),
+            geometry["edge_dual_normal_cartesian"][:, 0],
+            {"units": "meters"},
+        ),
+        (
+            "edge_dual_normal_cartesian_y",
+            ("edge",),
+            geometry["edge_dual_normal_cartesian"][:, 1],
+            {"units": "meters"},
+        ),
+        (
+            "edge_dual_normal_cartesian_z",
+            ("edge",),
+            geometry["edge_dual_normal_cartesian"][:, 2],
+            {"units": "meters"},
+        ),
+        ("zonal_normal_primal_edge", ("edge",), geometry["zonal_normal_primal_edge"], {"units": "radian"}),
+        (
+            "meridional_normal_primal_edge",
+            ("edge",),
+            geometry["meridional_normal_primal_edge"],
+            {"units": "radian"},
+        ),
+        ("zonal_normal_dual_edge", ("edge",), geometry["zonal_normal_dual_edge"], {"units": "radian"}),
+        (
+            "meridional_normal_dual_edge",
+            ("edge",),
+            geometry["meridional_normal_dual_edge"],
+            {"units": "radian"},
+        ),
+    ]
+
+
+def _hierarchy_fields(grid: IconGrid) -> list[IconNetcdfField]:
+    refinement = grid.refinement
+    return [
+        ("parent_cell_index", ("cell",), refinement["parent_cell_index"], {}),
+        ("parent_cell_type", ("cell",), refinement["parent_cell_type"], {}),
+        ("edge_parent_type", ("edge",), refinement["edge_parent_type"], {}),
+        ("parent_edge_index", ("edge",), refinement["parent_edge_index"], {}),
+        ("parent_vertex_index", ("vertex",), refinement["parent_vertex_index"], {}),
         ("child_cell_index", ("no", "cell"), np.zeros((4, grid.dims["cell"]), dtype=np.int32), {}),
         ("child_cell_id", ("cell",), np.zeros(grid.dims["cell"], dtype=np.int32), {}),
         ("child_edge_index", ("no", "edge"), np.zeros((4, grid.dims["edge"]), dtype=np.int32), {}),
         ("child_edge_id", ("edge",), np.zeros(grid.dims["edge"], dtype=np.int32), {}),
     ]
-    return [(name, dims, data, _with_icon_variable_attrs(name, attrs)) for name, dims, data, attrs in fields]
 
 
 def _with_icon_variable_attrs(name: str, attrs: dict[str, Any]) -> dict[str, Any]:
@@ -938,7 +1220,7 @@ def _with_icon_variable_attrs(name: str, attrs: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def _edge_lon_lat_bounds(grid: GeneratedGrid) -> tuple[np.ndarray, np.ndarray]:
+def _edge_lon_lat_bounds(grid: IconGrid) -> tuple[np.ndarray, np.ndarray]:
     """Return ICON-style four-point edge bounds in radians.
 
     The upstream grid generator stores bounds for each edge as a quadrilateral:
@@ -952,12 +1234,18 @@ def _edge_lon_lat_bounds(grid: GeneratedGrid) -> tuple[np.ndarray, np.ndarray]:
 
     lon[:, 0] = grid.vertex_lon[edge_vertices[:, 0]]
     lat[:, 0] = grid.vertex_lat[edge_vertices[:, 0]]
-    lon[:, 1] = grid.lon[edge_cells[:, 1]]
-    lat[:, 1] = grid.lat[edge_cells[:, 1]]
+    second_cell = edge_cells[:, 1]
+    second_cell_lon = np.where(second_cell >= 0, grid.lon[np.maximum(second_cell, 0)], grid.edge_lon)
+    second_cell_lat = np.where(second_cell >= 0, grid.lat[np.maximum(second_cell, 0)], grid.edge_lat)
+    lon[:, 1] = second_cell_lon
+    lat[:, 1] = second_cell_lat
     lon[:, 2] = grid.vertex_lon[edge_vertices[:, 1]]
     lat[:, 2] = grid.vertex_lat[edge_vertices[:, 1]]
-    lon[:, 3] = grid.lon[edge_cells[:, 0]]
-    lat[:, 3] = grid.lat[edge_cells[:, 0]]
+    first_cell = edge_cells[:, 0]
+    first_cell_lon = np.where(first_cell >= 0, grid.lon[np.maximum(first_cell, 0)], grid.edge_lon)
+    first_cell_lat = np.where(first_cell >= 0, grid.lat[np.maximum(first_cell, 0)], grid.edge_lat)
+    lon[:, 3] = first_cell_lon
+    lat[:, 3] = first_cell_lat
 
     pole_mask = np.isclose(np.abs(lat), 90.0)
     lon[pole_mask] = np.repeat(grid.edge_lon[:, np.newaxis], 4, axis=1)[pole_mask]
@@ -966,6 +1254,18 @@ def _edge_lon_lat_bounds(grid: GeneratedGrid) -> tuple[np.ndarray, np.ndarray]:
 
 def _zeros_fixed(name: str) -> np.ndarray:
     return np.zeros((1, FIXED_DIMS[name]), dtype=np.int32)
+
+
+def _start_index_fixed(name: str, size: int) -> np.ndarray:
+    values = np.full((1, FIXED_DIMS[name]), size + 1, dtype=np.int32)
+    values[:, ACTIVE_REFINEMENT_START[name] :] = 1
+    return values
+
+
+def _end_index_fixed(name: str, size: int) -> np.ndarray:
+    values = np.full((1, FIXED_DIMS[name]), size, dtype=np.int32)
+    values[:, ACTIVE_REFINEMENT_START[name] :] = 0
+    return values
 
 
 def _icon_connectivity(
@@ -1097,6 +1397,19 @@ def _geometry_fields(
         edge_center_xyz,
         sphere_radius,
     )
+    edge_system_orientation = _edge_system_orientation(
+        vertices,
+        cell_center_xyz,
+        edges,
+        edge_cells,
+        edge_center_xyz,
+    )
+    normals = _edge_normal_fields(
+        vertices,
+        edges,
+        edge_center_xyz,
+        edge_system_orientation,
+    )
     return {
         "cell_area": cell_areas,
         "dual_area": _dual_areas(vertices.shape[0], cells, cell_areas),
@@ -1105,22 +1418,233 @@ def _geometry_fields(
         "edge_cell_distance": edge_cell_distance,
         "edge_vert_distance": np.column_stack((edge_lengths * 0.5, edge_lengths * 0.5)),
         "orientation_of_normal": icon_connectivity["orientation_of_normal"],
-        "edge_system_orientation": np.ones(edges.shape[0], dtype=np.int32),
+        "edge_system_orientation": edge_system_orientation,
         "edge_orientation": icon_connectivity["edge_orientation"],
         "edgequad_area": 0.5 * edge_lengths * dual_edge_lengths,
+        **normals,
     }
 
 
+def _edge_system_orientation(
+    vertices: np.ndarray,
+    cell_center_xyz: np.ndarray,
+    edges: np.ndarray,
+    edge_cells: np.ndarray,
+    edge_center_xyz: np.ndarray,
+) -> np.ndarray:
+    unit_vertices = _normalize_rows(vertices)
+    unit_cells = _normalize_rows(cell_center_xyz)
+    unit_edges = _normalize_rows(edge_center_xyz)
+    vertex_direction = unit_vertices[edges[:, 1]] - unit_vertices[edges[:, 0]]
+    cell_direction = unit_cells[edge_cells[:, 1]] - unit_cells[edge_cells[:, 0]]
+    outward_component = np.sum(
+        np.cross(vertex_direction, cell_direction) * unit_edges,
+        axis=1,
+    )
+    if np.any(np.isclose(outward_component, 0.0)):
+        raise RuntimeError("edge system orientation is degenerate for at least one edge")
+    return np.where(outward_component > 0.0, 1, -1).astype(np.int32)
+
+
+def _edge_normal_fields(
+    vertices: np.ndarray,
+    edges: np.ndarray,
+    edge_center_xyz: np.ndarray,
+    edge_system_orientation: np.ndarray,
+) -> dict[str, np.ndarray]:
+    unit_vertices = _normalize_rows(vertices)
+    unit_edges = _normalize_rows(edge_center_xyz)
+    tangent = _normalize_rows(
+        edge_system_orientation[:, np.newaxis]
+        * (unit_vertices[edges[:, 1]] - unit_vertices[edges[:, 0]])
+    )
+    normal = _normalize_rows(np.cross(unit_edges, tangent))
+    primal_u, primal_v = _zonal_meridional_components(unit_edges, normal)
+    dual_u, dual_v = _zonal_meridional_components(unit_edges, tangent)
+    return {
+        "edge_primal_normal_cartesian": normal,
+        "edge_dual_normal_cartesian": tangent,
+        "zonal_normal_primal_edge": primal_u,
+        "meridional_normal_primal_edge": primal_v,
+        "zonal_normal_dual_edge": dual_u,
+        "meridional_normal_dual_edge": dual_v,
+    }
+
+
+def _zonal_meridional_components(
+    points: np.ndarray,
+    vectors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    unit_points = _normalize_rows(points)
+    lon = np.arctan2(unit_points[:, 1], unit_points[:, 0])
+    lat = np.arcsin(np.clip(unit_points[:, 2], -1.0, 1.0))
+    east = np.column_stack((-np.sin(lon), np.cos(lon), np.zeros_like(lon)))
+    north = np.column_stack(
+        (-np.sin(lat) * np.cos(lon), -np.sin(lat) * np.sin(lon), np.cos(lat))
+    )
+    return np.sum(vectors * east, axis=1), np.sum(vectors * north, axis=1)
+
+
+def _refinement_fields(
+    spec: IconGridSpec,
+    options: IconGridOptions,
+    vertices: np.ndarray,
+    cells: np.ndarray,
+    edges: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Return ICON refinement-control and parent-provenance fields.
+
+    For bisection-refined grids, fine vertices either coincide with a parent
+    vertex or with the midpoint of a parent edge. ICON encodes those two cases
+    in one field: positive values are one-based parent vertex IDs, and negative
+    values are one-based parent edge IDs with a minus sign.
+    """
+    refinement = {
+        "refin_c_ctrl": np.full(cells.shape[0], -4, dtype=np.int32),
+        "refin_e_ctrl": np.full(edges.shape[0], -8, dtype=np.int32),
+        "refin_v_ctrl": np.zeros(vertices.shape[0], dtype=np.int32),
+        "start_idx_c": _start_index_fixed("cell_grf", cells.shape[0]),
+        "end_idx_c": _end_index_fixed("cell_grf", cells.shape[0]),
+        "start_idx_e": _start_index_fixed("edge_grf", edges.shape[0]),
+        "end_idx_e": _end_index_fixed("edge_grf", edges.shape[0]),
+        "start_idx_v": _start_index_fixed("vert_grf", vertices.shape[0]),
+        "end_idx_v": _end_index_fixed("vert_grf", vertices.shape[0]),
+        "parent_cell_index": np.zeros(cells.shape[0], dtype=np.int32),
+        "parent_cell_type": np.zeros(cells.shape[0], dtype=np.int32),
+        "edge_parent_type": np.zeros(edges.shape[0], dtype=np.int32),
+        "parent_edge_index": np.zeros(edges.shape[0], dtype=np.int32),
+        "parent_vertex_index": np.zeros(vertices.shape[0], dtype=np.int32),
+    }
+    if spec.bisections == 0:
+        return refinement
+
+    parent = generate_grid(
+        f"R{spec.root:02d}B{spec.bisections - 1:02d}",
+        options=options,
+    )
+    parent_vertex_index = _parent_vertex_indices(vertices, parent)
+    refinement["parent_vertex_index"] = parent_vertex_index
+    refinement["parent_cell_index"], refinement["parent_cell_type"] = (
+        _parent_cell_fields(cells, parent_vertex_index, parent)
+    )
+    refinement["parent_edge_index"], refinement["edge_parent_type"] = (
+        _parent_edge_fields(edges, parent_vertex_index, parent)
+    )
+    return refinement
+
+
+def _parent_vertex_indices(vertices: np.ndarray, parent: IconGrid) -> np.ndarray:
+    lookup: dict[tuple[float, float, float], int] = {}
+    for vertex_index, point in enumerate(_normalize_rows(parent.vertices)):
+        lookup[_point_key(point)] = vertex_index + 1
+    for edge_index, point in enumerate(_normalize_rows(parent.edge_center_xyz)):
+        lookup[_point_key(point)] = -(edge_index + 1)
+
+    parent_index = np.empty(vertices.shape[0], dtype=np.int32)
+    for vertex_index, point in enumerate(_normalize_rows(vertices)):
+        value = lookup.get(_point_key(point))
+        if value is None:
+            raise RuntimeError(f"vertex {vertex_index} has no parent vertex or edge")
+        parent_index[vertex_index] = value
+    return parent_index
+
+
+def _point_key(point: np.ndarray) -> tuple[float, float, float]:
+    return tuple(np.round(point.astype(np.float64), decimals=POINT_MATCH_DECIMALS))
+
+
+def _parent_cell_fields(
+    cells: np.ndarray,
+    parent_vertex_index: np.ndarray,
+    parent: IconGrid,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map each fine cell to its parent cell and ICON child-cell type code."""
+    signature_map: dict[frozenset[int], tuple[int, int]] = {}
+    for parent_cell_index, (a, b, c) in enumerate(parent.cells):
+        e_ab, e_bc, e_ca = parent.cell_edges[parent_cell_index]
+        signatures = {
+            frozenset((int(a) + 1, -(int(e_ab) + 1), -(int(e_ca) + 1))): (
+                CHILD_CELL_TYPE_AT_VERTEX_0
+            ),
+            frozenset((int(b) + 1, -(int(e_ab) + 1), -(int(e_bc) + 1))): (
+                CHILD_CELL_TYPE_AT_VERTEX_1
+            ),
+            frozenset((int(c) + 1, -(int(e_ca) + 1), -(int(e_bc) + 1))): (
+                CHILD_CELL_TYPE_AT_VERTEX_2
+            ),
+            frozenset((-(int(e_ab) + 1), -(int(e_bc) + 1), -(int(e_ca) + 1))): (
+                CHILD_CELL_TYPE_CENTER
+            ),
+        }
+        for signature, child_type in signatures.items():
+            signature_map[signature] = (parent_cell_index + 1, child_type)
+
+    parent_cell_index = np.empty(cells.shape[0], dtype=np.int32)
+    parent_cell_type = np.empty(cells.shape[0], dtype=np.int32)
+    for cell_index, cell in enumerate(cells):
+        signature = frozenset(int(parent_vertex_index[vertex]) for vertex in cell)
+        parent_info = signature_map.get(signature)
+        if parent_info is None:
+            raise RuntimeError(f"cell {cell_index} has no parent cell")
+        parent_cell_index[cell_index], parent_cell_type[cell_index] = parent_info
+    return parent_cell_index, parent_cell_type
+
+
+def _parent_edge_fields(
+    edges: np.ndarray,
+    parent_vertex_index: np.ndarray,
+    parent: IconGrid,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map each fine edge to its parent edge and ICON child-edge type code."""
+    signature_map: dict[frozenset[int], tuple[int, int]] = {}
+    for parent_edge_index, (v0, v1) in enumerate(parent.edges):
+        midpoint = -(parent_edge_index + 1)
+        signature_map[frozenset((int(v0) + 1, midpoint))] = (
+            parent_edge_index + 1,
+            EDGE_CHILD_TYPE_FROM_VERTEX_0,
+        )
+        signature_map[frozenset((int(v1) + 1, midpoint))] = (
+            parent_edge_index + 1,
+            EDGE_CHILD_TYPE_FROM_VERTEX_1,
+        )
+
+    for parent_cell_index, (a, b, c) in enumerate(parent.cells):
+        del a, b, c
+        e_ab, e_bc, e_ca = (int(edge) for edge in parent.cell_edges[parent_cell_index])
+        signature_map[frozenset((-(e_ab + 1), -(e_ca + 1)))] = (
+            e_bc + 1,
+            EDGE_CHILD_TYPE_IN_CELL_OPPOSITE_VERTEX_0,
+        )
+        signature_map[frozenset((-(e_ab + 1), -(e_bc + 1)))] = (
+            e_ca + 1,
+            EDGE_CHILD_TYPE_IN_CELL_OPPOSITE_VERTEX_1,
+        )
+        signature_map[frozenset((-(e_ca + 1), -(e_bc + 1)))] = (
+            e_ab + 1,
+            EDGE_CHILD_TYPE_IN_CELL_OPPOSITE_VERTEX_2,
+        )
+
+    parent_edge_index = np.empty(edges.shape[0], dtype=np.int32)
+    edge_parent_type = np.empty(edges.shape[0], dtype=np.int32)
+    for edge_index, edge in enumerate(edges):
+        signature = frozenset(int(parent_vertex_index[vertex]) for vertex in edge)
+        parent_info = signature_map.get(signature)
+        if parent_info is None:
+            raise RuntimeError(f"edge {edge_index} has no parent edge")
+        parent_edge_index[edge_index], edge_parent_type[edge_index] = parent_info
+    return parent_edge_index, edge_parent_type
+
+
 def _metadata(
-    spec: GridSpec,
-    options: GridOptions,
+    spec: IconGridSpec | TorusGridSpec | LimitedAreaSpec,
+    options: IconGridOptions,
     geometry: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
-        "uuidOfHGrid": grid_uuid(spec.name),
+        "uuidOfHGrid": _spec_uuid(spec, options),
         "uuidOfParHGrid": "00000000-0000-0000-0000-000000000000",
-        "grid_root": spec.root,
-        "grid_level": spec.bisections,
+        "grid_root": getattr(spec, "root", 0),
+        "grid_level": getattr(spec, "bisections", 0),
         "sphere_radius": options.sphere_radius,
         "grid_geometry": 1,
         "grid_cell_type": 3,
@@ -1134,6 +1658,31 @@ def _metadata(
         "semi_major_axis": options.sphere_radius,
         "inverse_flattening": 0.0,
     }
+    if isinstance(spec, TorusGridSpec):
+        metadata.update(
+            {
+                "grid_geometry": 2,
+                "crs_name": "Planar torus",
+                "grid_mapping_name": "cartesian",
+                "domain_length": spec.domain_length,
+                "domain_height": spec.domain_height,
+                "torus_nx": spec.nx,
+                "torus_ny": spec.ny,
+                "torus_edge_length": spec.edge_length,
+            }
+        )
+    elif isinstance(spec, LimitedAreaSpec):
+        metadata.update(
+            {
+                "grid_geometry": 3,
+                "parent_grid_name": spec.parent_grid_name,
+                "lon_min": spec.lon_min,
+                "lon_max": spec.lon_max,
+                "lat_min": spec.lat_min,
+                "lat_max": spec.lat_max,
+                "boundary_depth_index": spec.boundary_depth,
+            }
+        )
     if geometry:
         metadata.update(
             {
@@ -1146,8 +1695,91 @@ def _metadata(
     return metadata
 
 
-def grid_uuid(grid_name: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"icon4py-demo/{grid_name}"))
+def _spec_uuid(
+    spec: IconGridSpec | TorusGridSpec | LimitedAreaSpec,
+    options: IconGridOptions,
+) -> str:
+    if isinstance(spec, IconGridSpec):
+        return grid_uuid(
+            spec.name,
+            sphere_radius=options.sphere_radius,
+            rotation_axis=options.rotation_axis,
+            rotation_angle_degrees=options.rotation_angle_degrees,
+        )
+    payload: dict[str, Any] = {
+        "generator": "grid_generator",
+        "grid": spec.name,
+        "sphere_radius": _canonical_float(options.sphere_radius),
+    }
+    if isinstance(spec, TorusGridSpec):
+        payload.update(
+            {
+                "family": "torus",
+                "nx": spec.nx,
+                "ny": spec.ny,
+                "edge_length": _canonical_float(spec.edge_length),
+            }
+        )
+    else:
+        payload.update(
+            {
+                "family": "limited_area",
+                "parent_grid_name": spec.parent_grid_name,
+                "bounds": [
+                    _canonical_float(spec.lon_min),
+                    _canonical_float(spec.lon_max),
+                    _canonical_float(spec.lat_min),
+                    _canonical_float(spec.lat_max),
+                ],
+                "boundary_depth": spec.boundary_depth,
+            }
+        )
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+    )
+
+
+def grid_uuid(
+    grid_name: str,
+    *,
+    sphere_radius: float = EARTH_RADIUS_M,
+    rotation_axis: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    rotation_angle_degrees: float = 0.0,
+) -> str:
+    payload = {
+        "generator": "grid_generator",
+        "grid": parse_grid_spec(grid_name).name,
+        "sphere_radius": _canonical_float(sphere_radius),
+        "rotation": _canonical_rotation(rotation_axis, rotation_angle_degrees),
+    }
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+    )
+
+
+def _canonical_rotation(
+    axis: tuple[float, float, float],
+    angle_degrees: float,
+) -> dict[str, Any]:
+    angle = _canonical_float(angle_degrees)
+    if angle == 0.0:
+        return {"axis": [0.0, 0.0, 0.0], "angle_degrees": 0.0}
+    normalized_axis = np.asarray(axis, dtype=np.float64)
+    normalized_axis = normalized_axis / np.linalg.norm(normalized_axis)
+    return {
+        "axis": [_canonical_float(value) for value in normalized_axis],
+        "angle_degrees": angle,
+    }
+
+
+def _canonical_float(value: float) -> float:
+    return float(f"{float(value):.17g}")
 
 
 def _sort_around_vertex(
