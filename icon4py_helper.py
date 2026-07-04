@@ -163,6 +163,9 @@ DEFAULT_PYTHON_GRID_OPTIONS = {
     "max_cells": 1_000_000,
     "radius": 1.0,
     "sphere_radius": 6_371_229.0,
+    "rotation_axis": (1.0, 0.0, 0.0),
+    # Avoid exact coordinate degeneracies in ICON4Py interpolation weight setup.
+    "rotation_angle_degrees": 0.05,
 }
 
 LOG_LEVELS = {
@@ -406,6 +409,24 @@ def configure_warning_filters(config, *, validate=True):
     )
     warnings.filterwarnings(
         "ignore",
+        message="divide by zero encountered in .*",
+        category=RuntimeWarning,
+        module=r"icon4py\.model\.common\.interpolation\.interpolation_fields",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="invalid value encountered in .*",
+        category=RuntimeWarning,
+        module=r"icon4py\.model\.common\.interpolation\.interpolation_fields",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="divide by zero encountered in scalar divide",
+        category=RuntimeWarning,
+        module=r"gt4py\.next\.iterator\.transforms\.constant_folding",
+    )
+    warnings.filterwarnings(
+        "ignore",
         message="Field View Program .* Using Python execution.*",
         category=UserWarning,
         module=r"icon4py\.model\.common\.states\.factory",
@@ -591,7 +612,8 @@ def create_python_grid(grid_name, options=None):
             "max_cells": resolved["max_cells"],
             "radius": resolved["radius"],
             "sphere_radius": resolved["sphere_radius"],
-            "include_edges": True,
+            "rotation_axis": resolved["rotation_axis"],
+            "rotation_angle_degrees": resolved["rotation_angle_degrees"],
         },
     )
     runtime = create_python_grid_runtime(generated, resolved)
@@ -850,7 +872,7 @@ def python_grid_geometry_fields(generated: Any, allocator):
         ),
         gridfile.GeometryName.TANGENT_ORIENTATION.value: gtx.as_field(
             (dims.EdgeDim,),
-            np.ones(generated.dims["edge"], dtype=np.float64),
+            geometry["edge_system_orientation"].astype(np.float64),
             allocator=allocator,
         ),
         gridfile.GeometryName.CELL_NORMAL_ORIENTATION.value: gtx.as_field(
@@ -1084,12 +1106,21 @@ def state_field_diagnostics(state, time=None):
         )
         array = np.asarray(selected)
         finite = np.isfinite(array)
+        finite_values = array[finite]
+        if finite_values.size:
+            min_value = float(np.min(finite_values))
+            mean_value = float(np.mean(finite_values))
+            max_value = float(np.max(finite_values))
+        else:
+            min_value = float("nan")
+            mean_value = float("nan")
+            max_value = float("nan")
         rows.append(
             {
                 "field": field_name,
-                "min": float(np.nanmin(array)),
-                "mean": float(np.nanmean(array)),
-                "max": float(np.nanmax(array)),
+                "min": min_value,
+                "mean": mean_value,
+                "max": max_value,
                 "finite_fraction": float(finite.sum() / finite.size),
             }
         )

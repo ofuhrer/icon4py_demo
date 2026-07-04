@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 import sys
+import warnings
 from types import SimpleNamespace
 
 import matplotlib
@@ -110,6 +111,13 @@ def test_check_config_normalizes_defaults_and_rejects_invalid_values():
         helper.check_config({"backend": "embedded", "log_level": "chatty"})
     with pytest.raises(ValueError, match="levels"):
         helper.check_config({"backend": "embedded", "levels": 1})
+
+
+def test_python_grid_options_apply_icon4py_rotation_workaround_by_default():
+    options = helper.resolve_python_grid_options(None)
+
+    assert options["rotation_axis"] == (1.0, 0.0, 0.0)
+    assert options["rotation_angle_degrees"] == 0.05
 
 
 def test_r02b03_grid_option_is_available():
@@ -594,6 +602,8 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
 
 
 def test_public_create_grid_returns_icon4py_helper_shaped_grid():
+    from icon4py.model.common.grid import gridfile
+
     grid = helper.create_python_grid(
         "R01B00", options={"backend": "embedded", "levels": 5}
     )
@@ -616,6 +626,19 @@ def test_public_create_grid_returns_icon4py_helper_shaped_grid():
     assert grid.runtime.manager.grid.num_cells == 20
     assert "_icon_grid" not in grid
     assert "_runtime" not in grid
+
+    geometry_fields = helper.python_grid_geometry_fields(
+        grid["generated"],
+        grid.runtime.allocator,
+    )
+    tangent_orientation = geometry_fields[
+        gridfile.GeometryName.TANGENT_ORIENTATION.value
+    ].asnumpy()
+    assert np.array_equal(
+        tangent_orientation,
+        grid["generated"].geometry["edge_system_orientation"].astype(np.float64),
+    )
+    assert set(np.unique(tangent_orientation)) == {-1.0, 1.0}
 
 
 def test_diagnostics_and_plots_work_for_synthetic_xarray():
@@ -649,6 +672,25 @@ def test_diagnostics_and_plots_work_for_synthetic_xarray():
     assert len(axes) == 2
     assert len(diag_axes) == 1
     assert diag_axes[0].get_ylabel() == "temperature"
+
+
+def test_state_field_diagnostics_handles_all_nan_fields_without_warning():
+    _, state = synthetic_grid_and_state()
+    state["xarray"]["all_nan"] = (
+        ("cell",),
+        np.full(state["xarray"].sizes["cell"], np.nan),
+    )
+
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        rows = helper.state_field_diagnostics(state)
+
+    all_nan = next(row for row in rows if row["field"] == "all_nan")
+    assert not records
+    assert np.isnan(all_nan["min"])
+    assert np.isnan(all_nan["mean"])
+    assert np.isnan(all_nan["max"])
+    assert all_nan["finite_fraction"] == 0.0
 
 
 def test_plot_diagnostics_resolves_common_icon_field_aliases():
