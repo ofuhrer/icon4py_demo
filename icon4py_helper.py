@@ -8,8 +8,10 @@ import json
 import os
 import pathlib
 import re
+import uuid
 import warnings
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 
@@ -21,7 +23,6 @@ if venv_bin.exists() and str(venv_bin) not in os.environ.get("PATH", "").split(o
 
 import gt4py.next as gtx
 import matplotlib.pyplot as plt
-import netCDF4 as nc
 import numpy as np
 import xarray as xr
 from gt4py.next import config as gt4py_config
@@ -58,11 +59,8 @@ from icon4py.model.standalone_driver.initial_condition.analytical import (
     jablonowski_williamson as ic_jw,
 )
 
-
-@dataclass(frozen=True)
-class GridDescription:
-    name: str
-    filename: str
+from grid_generator import icon_netcdf
+from grid_generator.grid_generator import GeneratedGrid, generate_grid
 
 
 @dataclass(frozen=True)
@@ -73,6 +71,17 @@ class GridRuntime:
     vertical_grid_config: Any
     manager: Any
     icon_grid: Any
+
+
+@dataclass(frozen=True)
+class InMemoryGridManager:
+    """Small GridManager-compatible object backed by generated Python arrays."""
+
+    grid: Any
+    decomposition_info: Any
+    coordinates: dict
+    geometry_fields: dict
+    file_path: str
 
 
 @dataclass
@@ -91,15 +100,6 @@ class StateRuntime:
     step_count: int = 0
 
 
-GRID_FILES = {
-    "R01B01": GridDescription(name="R01B01", filename="r01b01.nc"),
-    "R1B1": GridDescription(name="R01B01", filename="r01b01.nc"),
-    "R02B03": GridDescription(name="icon_grid_0030_R02B03_G", filename="r02b03.nc"),
-    "R2B3": GridDescription(name="icon_grid_0030_R02B03_G", filename="r02b03.nc"),
-    "R02B04": GridDescription(name="icon_grid_0013_R02B04_R", filename="r02b04.nc"),
-    "R2B4": GridDescription(name="icon_grid_0013_R02B04_R", filename="r02b04.nc"),
-}
-
 DEFAULT_CONFIG = {
     "grid": "R01B01",
     "backend": "gtfn_cpu",
@@ -111,6 +111,14 @@ DEFAULT_CONFIG = {
     "gt4py_cache_dir": str(PROJECT_ROOT / ".gt4py_cache"),
     "gt4py_cache_lifetime": "persistent",
     "suppress_warnings": True,
+}
+
+DEFAULT_PYTHON_GRID_OPTIONS = {
+    "backend": "embedded",
+    "levels": 10,
+    "max_cells": 1_000_000,
+    "radius": 1.0,
+    "sphere_radius": 6_371_229.0,
 }
 
 LOG_LEVELS = {
@@ -212,11 +220,8 @@ def check_config(config=None):
     """Validate and normalize the public notebook configuration dictionary."""
     merged = normalize_config(config)
     grid_name = str(merged["grid"]).upper()
-    if grid_name not in available_grids():
-        raise NotImplementedError(
-            f"{merged['grid']!r} is not available here. Use one of {available_grids()} "
-            "or extend create_grid with a pre-generated ICON grid file."
-        )
+    if parse_icon_grid_name(grid_name) is None:
+        raise ValueError("Config value 'grid' must have the form RxxByy, for example R02B03.")
     if merged["backend"] not in model_backends.BACKENDS:
         raise ValueError(
             f"Invalid backend {merged['backend']!r}. Use one of {sorted(model_backends.BACKENDS)}."
@@ -248,8 +253,8 @@ def check_config(config=None):
 
 
 def available_grids():
-    """Return the named grid choices supported by this notebook helper."""
-    return sorted(GRID_FILES)
+    """Return example grid choices that are small enough for the notebook demo."""
+    return ["R01B00", "R01B01", "R02B03", "R02B04"]
 
 
 def log(config, message, level="info"):
@@ -462,21 +467,6 @@ def gridline_sphere_coordinates(grid):
     return line_x, line_y, line_z
 
 
-def resolve_grid_file(grid_name, config):
-    """Return the local NetCDF grid file and display name for a configured grid."""
-    grid_name = grid_name.upper()
-    source = GRID_FILES[grid_name]
-    grid_file = PROJECT_ROOT / "data" / source.filename
-    log(config, f"[grid] resolving {grid_name} grid file")
-    if not grid_file.exists():
-        raise FileNotFoundError(
-            f"Grid file for {grid_name} is missing: {grid_file}. "
-            "Expected the bundled demo grid files under data/."
-        )
-    log(config, f"[grid] using local grid file {grid_file}", level="debug")
-    return grid_file, source.name
-
-
 class DisplayablePlotlyFigure:
     """A Plotly figure with notebook MIME and iframe HTML display fallbacks."""
 
@@ -515,77 +505,334 @@ class DisplayablePlotlyFigure:
         return bundle, {}
 
 
-def create_grid(config):
-    config = check_config(config)
-    configure_warning_filters(config)
-    configure_gt4py_cache(config)
-    grid_name = config["grid"].upper()
-    grid_file, grid_display_name = resolve_grid_file(grid_name, config)
+def create_python_grid(grid_name, options=None):
+    """Create an icon4py helper-shaped grid dictionary entirely in Python."""
+    resolved = resolve_python_grid_options(options)
+    generated = generate_grid(
+        grid_name,
+        options={
+            "max_cells": resolved["max_cells"],
+            "radius": resolved["radius"],
+            "include_edges": True,
+        },
+    )
+    runtime = create_python_grid_runtime(generated, resolved)
+    vertical = vertical_level_distribution(
+        runtime.vertical_grid_config,
+        runtime.allocator,
+    )
+    cell_vertex_lon = plot_cell_vertex_longitudes(generated)
 
-    log(config, f"[backend] selecting {config['backend']}")
-    backend_descriptor = driver_utils.get_backend_from_name(config["backend"])
+    return {
+        "name": generated.name,
+        "kind": generated.name,
+        "file": None,
+        "lon": generated.lon,
+        "lat": generated.lat,
+        "cell_vertex_lon": cell_vertex_lon,
+        "cell_vertex_lat": generated.cell_vertex_lat,
+        "dims": generated.dims,
+        "num_levels": resolved["levels"],
+        "vertical": vertical,
+        "vertical_interfaces": vertical["interface_height"].values,
+        "vertical_layer_thickness": vertical["layer_thickness"].values,
+        "backend": resolved["backend"],
+        "generated": generated,
+        "connectivity": public_python_grid_connectivity(generated),
+        "geometry": public_python_grid_geometry(generated, resolved["sphere_radius"]),
+        "metadata": public_python_grid_metadata(generated, resolved["sphere_radius"]),
+        "_config": dict(resolved),
+        "_runtime": runtime,
+        "_backend": runtime.backend,
+        "_allocator": runtime.allocator,
+        "_process_props": runtime.process_props,
+        "_vertical_grid_config": runtime.vertical_grid_config,
+        "_manager": runtime.manager,
+        "_icon_grid": runtime.icon_grid,
+    }
+
+
+def resolve_python_grid_options(options):
+    resolved = dict(DEFAULT_PYTHON_GRID_OPTIONS)
+    if options:
+        resolved.update(options)
+    if not isinstance(resolved["levels"], int) or resolved["levels"] < 2:
+        raise ValueError("levels must be an integer greater than 1")
+    if resolved["sphere_radius"] <= 0:
+        raise ValueError("sphere_radius must be positive")
+    return resolved
+
+
+def create_python_grid_runtime(generated: GeneratedGrid, options):
+    from icon4py.model.common.decomposition import halo
+    from icon4py.model.common.grid import base, grid_manager, grid_refinement, icon
+    from icon4py.model.common.utils import data_allocation as data_alloc
+
+    backend_descriptor = driver_utils.get_backend_from_name(options["backend"])
     if isinstance(backend_descriptor, dict):
         backend_descriptor = dict(backend_descriptor)
         backend_descriptor["cached"] = True
     backend = model_options.customize_backend(None, backend_descriptor)
     allocator = model_backends.get_allocator(backend)
     process_props = decomp_defs.get_process_properties(decomp_defs.SingleNodeRun())
-    vertical_grid_config = v_grid.VerticalGridConfig(num_levels=config["levels"])
-    vertical = vertical_level_distribution(vertical_grid_config, allocator)
+    vertical_grid_config = v_grid.VerticalGridConfig(num_levels=options["levels"])
 
-    log(config, "[grid] building GridManager from ICON grid NetCDF")
-    grid_manager = driver_utils.create_grid_manager(
-        grid_file_path=grid_file,
-        vertical_grid_config=vertical_grid_config,
+    xp = data_alloc.import_array_ns(allocator)
+    horizontal_size = base.HorizontalGridSize(
+        num_vertices=generated.dims["vertex"],
+        num_edges=generated.dims["edge"],
+        num_cells=generated.dims["cell"],
+    )
+    decomposition_info = halo.NoHalos(horizontal_size, allocator=allocator)(
+        xp.zeros(generated.dims["cell"], dtype=gtx.int32)
+    )
+    refinement_fields = python_grid_refinement_fields(generated, allocator)
+    start_index, end_index = icon.get_start_and_end_index(
+        partial(
+            grid_refinement.compute_domain_bounds,
+            refinement_fields=refinement_fields,
+            decomposition_info=decomposition_info,
+        )
+    )
+    neighbor_tables = python_grid_neighbor_tables(generated)
+    neighbor_tables.update(grid_manager._get_derived_connectivities(neighbor_tables))
+    icon_grid = icon.icon_grid(
+        id_=python_grid_uuid(generated),
+        allocator=allocator,
+        config=base.GridConfig(
+            horizontal_config=horizontal_size,
+            vertical_size=options["levels"],
+            limited_area=False,
+            distributed=False,
+            keep_skip_values=True,
+        ),
+        neighbor_tables=neighbor_tables,
+        start_index=start_index,
+        end_index=end_index,
+        grid_params=icon.GridParams(
+            icon.IcosahedronParams(
+                subdivision=icon.GridSubdivision(
+                    root=generated.spec.root,
+                    level=generated.spec.bisections,
+                ),
+                radius=options["sphere_radius"],
+            )
+        ),
+        refinement_control=refinement_fields,
+    )
+    manager = InMemoryGridManager(
+        grid=icon_grid,
+        decomposition_info=decomposition_info,
+        coordinates=python_grid_coordinates(generated, allocator),
+        geometry_fields=python_grid_geometry_fields(
+            generated,
+            options["sphere_radius"],
+            allocator,
+        ),
+        file_path=f"python-generated:{generated.name}",
+    )
+    return GridRuntime(
+        backend=backend,
         allocator=allocator,
         process_props=process_props,
+        vertical_grid_config=vertical_grid_config,
+        manager=manager,
+        icon_grid=icon_grid,
     )
 
-    with nc.Dataset(grid_file) as grid_ds:
-        lon = np.degrees(np.asarray(grid_ds.variables["clon"][:]))
-        lat = np.degrees(np.asarray(grid_ds.variables["clat"][:]))
-        cell_vertex_lon = np.degrees(np.asarray(grid_ds.variables["clon_vertices"][:]))
-        cell_vertex_lat = np.degrees(np.asarray(grid_ds.variables["clat_vertices"][:]))
-        dims = {dim: len(grid_ds.dimensions[dim]) for dim in ("cell", "edge", "vertex")}
-    lon = ((lon + 180.0) % 360.0) - 180.0
-    cell_vertex_lon = ((cell_vertex_lon + 180.0) % 360.0) - 180.0
-    cell_vertex_lon = normalize_polar_vertex_longitudes(cell_vertex_lon, cell_vertex_lat, lon)
-    cell_vertex_lon = unwrap_cell_vertex_longitudes(cell_vertex_lon, lon)
 
-    grid = {
-        "name": grid_display_name,
-        "kind": grid_name,
-        "file": grid_file,
-        "lon": lon,
-        "lat": lat,
-        "cell_vertex_lon": cell_vertex_lon,
-        "cell_vertex_lat": cell_vertex_lat,
-        "dims": dims,
-        "num_levels": config["levels"],
-        "vertical": vertical,
-        "vertical_interfaces": vertical["interface_height"].values,
-        "vertical_layer_thickness": vertical["layer_thickness"].values,
-        "backend": config["backend"],
-        "_config": dict(config),
-        "_runtime": GridRuntime(
-            backend=backend,
-            allocator=allocator,
-            process_props=process_props,
-            vertical_grid_config=vertical_grid_config,
-            manager=grid_manager,
-            icon_grid=grid_manager.grid,
-        ),
-        "_backend": backend,
-        "_allocator": allocator,
-        "_process_props": process_props,
-        "_vertical_grid_config": vertical_grid_config,
-        "_manager": grid_manager,
-        "_icon_grid": grid_manager.grid,
+def python_grid_neighbor_tables(generated: GeneratedGrid):
+    connectivity = icon_netcdf._connectivity(generated)
+    return {
+        dims.C2E2C: connectivity["c2c"],
+        dims.C2E: connectivity["c2e"],
+        dims.E2C: np.asarray(generated.edge_cells, dtype=np.int32),
+        dims.V2E: zero_based_with_skip(connectivity["v2e"]),
+        dims.V2C: zero_based_with_skip(connectivity["v2c"]),
+        dims.C2V: np.asarray(generated.cells, dtype=np.int32),
+        dims.V2E2V: zero_based_with_skip(connectivity["v2v"]),
+        dims.E2V: np.asarray(generated.edges, dtype=np.int32),
     }
+
+
+def python_grid_refinement_fields(generated: GeneratedGrid, allocator):
+    return {
+        dims.CellDim: gtx.as_field(
+            (dims.CellDim,),
+            np.full(generated.dims["cell"], -4, dtype=np.int32),
+            allocator=allocator,
+        ),
+        dims.EdgeDim: gtx.as_field(
+            (dims.EdgeDim,),
+            np.full(generated.dims["edge"], -8, dtype=np.int32),
+            allocator=allocator,
+        ),
+        dims.VertexDim: gtx.as_field(
+            (dims.VertexDim,),
+            np.zeros(generated.dims["vertex"], dtype=np.int32),
+            allocator=allocator,
+        ),
+    }
+
+
+def python_grid_coordinates(generated: GeneratedGrid, allocator):
+    edge_lon, edge_lat = icon_netcdf._lon_lat(icon_netcdf._edge_centers(generated))
+    return {
+        dims.CellDim: {
+            "lat": gtx.as_field((dims.CellDim,), np.radians(generated.lat), allocator=allocator),
+            "lon": gtx.as_field((dims.CellDim,), np.radians(generated.lon), allocator=allocator),
+        },
+        dims.EdgeDim: {
+            "lat": gtx.as_field((dims.EdgeDim,), edge_lat, allocator=allocator),
+            "lon": gtx.as_field((dims.EdgeDim,), edge_lon, allocator=allocator),
+        },
+        dims.VertexDim: {
+            "lat": gtx.as_field(
+                (dims.VertexDim,), np.radians(generated.vertex_lat), allocator=allocator
+            ),
+            "lon": gtx.as_field(
+                (dims.VertexDim,), np.radians(generated.vertex_lon), allocator=allocator
+            ),
+        },
+    }
+
+
+def python_grid_geometry_fields(generated: GeneratedGrid, sphere_radius, allocator):
+    from icon4py.model.common.grid import gridfile
+
+    connectivity = icon_netcdf._connectivity(generated)
+    edge_lengths = icon_netcdf._edge_lengths(generated, sphere_radius)
+    return {
+        gridfile.GeometryName.CELL_AREA.value: gtx.as_field(
+            (dims.CellDim,),
+            icon_netcdf._cell_areas(generated, sphere_radius),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.DUAL_AREA.value: gtx.as_field(
+            (dims.VertexDim,),
+            icon_netcdf._dual_areas(generated, sphere_radius),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.EDGE_LENGTH.value: gtx.as_field(
+            (dims.EdgeDim,), edge_lengths, allocator=allocator
+        ),
+        gridfile.GeometryName.DUAL_EDGE_LENGTH.value: gtx.as_field(
+            (dims.EdgeDim,),
+            icon_netcdf._dual_edge_lengths(generated, sphere_radius),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.EDGE_CELL_DISTANCE.value: gtx.as_field(
+            (dims.EdgeDim, dims.E2CDim),
+            icon_netcdf._edge_cell_distances(generated, sphere_radius),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.EDGE_VERTEX_DISTANCE.value: gtx.as_field(
+            (dims.EdgeDim, dims.E2VDim),
+            np.column_stack((edge_lengths * 0.5, edge_lengths * 0.5)),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.TANGENT_ORIENTATION.value: gtx.as_field(
+            (dims.EdgeDim,),
+            np.ones(generated.dims["edge"], dtype=np.float64),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.CELL_NORMAL_ORIENTATION.value: gtx.as_field(
+            (dims.CellDim, dims.C2EDim),
+            connectivity["orientation_of_normal"].astype(np.float64),
+            allocator=allocator,
+        ),
+        gridfile.GeometryName.EDGE_ORIENTATION_ON_VERTEX.value: gtx.as_field(
+            (dims.VertexDim, dims.V2EDim),
+            connectivity["edge_orientation"],
+            allocator=allocator,
+        ),
+    }
+
+
+def public_python_grid_connectivity(generated: GeneratedGrid):
+    connectivity = icon_netcdf._connectivity(generated)
+    return {
+        "edge_of_cell": connectivity["c2e"],
+        "vertex_of_cell": generated.cells,
+        "neighbor_cell_index": connectivity["c2c"],
+        "adjacent_cell_of_edge": generated.edge_cells,
+        "edge_vertices": generated.edges,
+        "cells_of_vertex": zero_based_with_skip(connectivity["v2c"]),
+        "edges_of_vertex": zero_based_with_skip(connectivity["v2e"]),
+        "vertices_of_vertex": zero_based_with_skip(connectivity["v2v"]),
+    }
+
+
+def public_python_grid_geometry(generated: GeneratedGrid, sphere_radius):
+    connectivity = icon_netcdf._connectivity(generated)
+    edge_lengths = icon_netcdf._edge_lengths(generated, sphere_radius)
+    return {
+        "cell_area": icon_netcdf._cell_areas(generated, sphere_radius),
+        "dual_area": icon_netcdf._dual_areas(generated, sphere_radius),
+        "edge_length": edge_lengths,
+        "dual_edge_length": icon_netcdf._dual_edge_lengths(generated, sphere_radius),
+        "edge_cell_distance": icon_netcdf._edge_cell_distances(generated, sphere_radius),
+        "edge_vert_distance": np.column_stack((edge_lengths * 0.5, edge_lengths * 0.5)),
+        "orientation_of_normal": connectivity["orientation_of_normal"],
+        "edge_system_orientation": np.ones(generated.dims["edge"], dtype=np.int32),
+        "edge_orientation": connectivity["edge_orientation"],
+    }
+
+
+def public_python_grid_metadata(generated: GeneratedGrid, sphere_radius):
+    return {
+        "uuidOfHGrid": python_grid_uuid(generated),
+        "grid_root": generated.spec.root,
+        "grid_level": generated.spec.bisections,
+        "sphere_radius": sphere_radius,
+        "grid_geometry": 1,
+        "grid_cell_type": 3,
+    }
+
+
+def plot_cell_vertex_longitudes(generated: GeneratedGrid):
+    lon = ((generated.lon + 180.0) % 360.0) - 180.0
+    vertex_lon = ((generated.cell_vertex_lon + 180.0) % 360.0) - 180.0
+    polar_vertices = np.abs(generated.cell_vertex_lat) > 89.0
+    vertex_lon = np.array(vertex_lon, copy=True)
+    vertex_lon[polar_vertices] = np.broadcast_to(lon[:, np.newaxis], vertex_lon.shape)[
+        polar_vertices
+    ]
+    vertex_lon = np.where(vertex_lon - lon[:, np.newaxis] > 180.0, vertex_lon - 360.0, vertex_lon)
+    return np.where(vertex_lon - lon[:, np.newaxis] < -180.0, vertex_lon + 360.0, vertex_lon)
+
+
+def zero_based_with_skip(one_based):
+    return np.where(one_based == 0, -1, one_based - 1).astype(np.int32)
+
+
+def python_grid_uuid(generated: GeneratedGrid):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"icon4py-demo/{generated.name}"))
+
+
+def create_grid(config):
+    config = check_config(config)
+    configure_warning_filters(config)
+    configure_gt4py_cache(config)
+    grid_name = config["grid"].upper()
+    log(config, f"[grid] generating {grid_name} grid in memory")
+    grid = create_python_grid(
+        grid_name,
+        options={
+            "backend": config["backend"],
+            "levels": config["levels"],
+            "max_cells": DEFAULT_PYTHON_GRID_OPTIONS["max_cells"],
+            "radius": DEFAULT_PYTHON_GRID_OPTIONS["radius"],
+            "sphere_radius": DEFAULT_PYTHON_GRID_OPTIONS["sphere_radius"],
+        },
+    )
+    grid["_config"] = dict(config)
+    vertical = grid["vertical"]
 
     log(
         config,
-        f"[grid] ready: cells={dims['cell']}, edges={dims['edge']}, levels={config['levels']}",
+        f"[grid] ready: cells={grid['dims']['cell']}, edges={grid['dims']['edge']}, "
+        f"levels={config['levels']}",
     )
     log(
         config,
@@ -600,8 +847,11 @@ def create_grid(config):
             config,
             str(
                 v_grid.VerticalGrid(
-                    vertical_grid_config,
-                    *v_grid.get_vct_a_and_vct_b(vertical_grid_config, allocator),
+                    grid["_runtime"].vertical_grid_config,
+                    *v_grid.get_vct_a_and_vct_b(
+                        grid["_runtime"].vertical_grid_config,
+                        grid["_runtime"].allocator,
+                    ),
                 )
             ),
             level="debug",

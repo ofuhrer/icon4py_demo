@@ -21,7 +21,6 @@ ipykernel
 nbconvert
 nbformat
 matplotlib
-netCDF4
 plotly
 tqdm
 xarray
