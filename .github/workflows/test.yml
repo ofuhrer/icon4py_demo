@@ -39,7 +39,7 @@ jobs:
           PY
 
       - name: Ruff
-        run: python -m ruff check icon4py_helper.py test_icon4py_helper.py test_notebook_hygiene.py
+        run: python -m ruff check icon4py_helper.py scripts tests
 
       - name: Tests
         run: python -m pytest -q

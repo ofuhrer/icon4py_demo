@@ -11,6 +11,5 @@ markers = [
     "slow: expensive ICON4Py workflow checks",
 ]
 testpaths = [
-    "test_icon4py_helper.py",
-    "test_notebook_hygiene.py",
+    "tests",
 ]

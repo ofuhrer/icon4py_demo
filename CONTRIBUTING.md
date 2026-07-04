@@ -21,7 +21,7 @@ repository.
 Run the lightweight checks before opening a pull request:
 
 ```bash
-.venv/bin/ruff check icon4py_helper.py test_icon4py_helper.py test_notebook_hygiene.py
+.venv/bin/ruff check icon4py_helper.py scripts tests
 .venv/bin/python -m pytest -q
 ```
 

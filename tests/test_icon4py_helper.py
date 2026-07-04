@@ -15,7 +15,7 @@ from matplotlib.collections import PolyCollection
 
 matplotlib.use("Agg")
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
+sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
 
 import icon4py_helper as helper
 

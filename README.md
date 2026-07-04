@@ -10,6 +10,8 @@ ICON4Py atmosphere experiment from Python. It generates an ICON grid in memory,
 builds an analytical dry Jablonowski-Williamson initial condition, runs a short
 time integration, and plots selected state fields and diagnostics.
 
+![Temperature anomaly evolution generated with the demo](docs/assets/temperature_evolution.png)
+
 The goal is to make the Python-facing workflow understandable: configuration,
 grid creation, state initialization, model construction, timestepping, and
 visualization are kept as explicit notebook steps.
@@ -70,7 +72,7 @@ Then open `http://127.0.0.1:8888/lab` and select the `ICON4Py demo` kernel.
 Run the lightweight checks used for development:
 
 ```bash
-.venv/bin/ruff check icon4py_helper.py test_icon4py_helper.py test_notebook_hygiene.py
+.venv/bin/ruff check icon4py_helper.py scripts tests
 .venv/bin/python -m pytest -q
 ```
 
@@ -93,6 +95,12 @@ PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m nbconvert \
 ```
 
 This keeps execution counts and generated outputs out of the tracked notebook.
+
+The README figure is generated from the same helper workflow as the notebook:
+
+```bash
+.venv/bin/python scripts/generate_readme_figure.py
+```
 
 ## Notebook Hygiene
 

@@ -7,6 +7,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+output/
 grid_generator/grid-generator/
 packages/icon-grid-generator/
 tmp/
