@@ -3,7 +3,6 @@
 [![Tests](https://github.com/ofuhrer/icon4py_demo/actions/workflows/test.yml/badge.svg)](https://github.com/ofuhrer/icon4py_demo/actions/workflows/test.yml)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
-[![icon-grid-generator](https://img.shields.io/pypi/v/icon-grid-generator?label=icon-grid-generator)](https://pypi.org/project/icon-grid-generator/)
 [![Notebook](https://img.shields.io/badge/notebook-nbviewer-orange.svg)](https://nbviewer.org/github/ofuhrer/icon4py_demo/blob/main/icon4py_demo.ipynb)
 
 This repository contains a small, inspectable Jupyter notebook that runs an
@@ -30,11 +29,6 @@ preview. For local experimentation, run it in JupyterLab as described below.
 - A working C++ build toolchain for GT4Py/ICON4Py stencil compilation
 - Network access during installation, because ICON4Py packages are installed
   from a pinned upstream Git commit
-
-The demo uses the published
-[`icon-grid-generator`](https://pypi.org/project/icon-grid-generator/) package
-from PyPI. The grid generator is developed in its own repository:
-[`ofuhrer/icon-grid-generator`](https://github.com/ofuhrer/icon-grid-generator).
 
 ## Quickstart
 
