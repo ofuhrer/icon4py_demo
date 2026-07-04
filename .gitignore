@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 .ipynb_checkpoints/
 grid_generator/grid-generator/
+packages/icon-grid-generator/
 tmp/
 
 *.html
