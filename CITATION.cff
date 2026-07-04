@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this demo, please cite it as below."
+title: "ICON in Python Demo"
+type: software
+authors:
+  - family-names: Fuhrer
+    given-names: Oliver
+    affiliation: MeteoSwiss
+license: BSD-3-Clause
+repository-code: "https://github.com/ofuhrer/icon4py_demo"
+abstract: "A Jupyter notebook demonstrating an ICON4Py atmosphere experiment from Python."
+keywords:
+  - ICON
+  - ICON4Py
+  - atmospheric modeling
+  - numerical weather prediction
+  - Jupyter

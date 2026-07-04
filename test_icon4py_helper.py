@@ -531,6 +531,7 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
     )
 
 
+@pytest.mark.slow
 def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     config = helper.check_config(

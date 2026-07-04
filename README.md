@@ -1,11 +1,44 @@
 # ICON in Python Demo
 
-This directory contains a local notebook demonstrating ICON in Python.
+[![Tests](https://github.com/ofuhrer/icon4py_demo/actions/workflows/test.yml/badge.svg)](https://github.com/ofuhrer/icon4py_demo/actions/workflows/test.yml)
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
+[![icon-grid-generator](https://img.shields.io/pypi/v/icon-grid-generator?label=icon-grid-generator)](https://pypi.org/project/icon-grid-generator/)
+[![Notebook](https://img.shields.io/badge/notebook-nbviewer-orange.svg)](https://nbviewer.org/github/ofuhrer/icon4py_demo/blob/main/icon4py_demo.ipynb)
 
-## Setup
+This repository contains a small, inspectable Jupyter notebook that runs an
+ICON4Py atmosphere experiment from Python. It generates an ICON grid in memory,
+builds an analytical dry Jablonowski-Williamson initial condition, runs a short
+time integration, and plots selected state fields and diagnostics.
 
-From this directory, create a local virtual environment and install ICON4Py from
-the upstream GitHub source packages:
+The goal is to make the Python-facing workflow understandable: configuration,
+grid creation, state initialization, model construction, timestepping, and
+visualization are kept as explicit notebook steps.
+
+## Notebook
+
+- Open the notebook on GitHub: [icon4py_demo.ipynb](icon4py_demo.ipynb)
+- View a rendered copy on nbviewer:
+  [icon4py_demo.ipynb](https://nbviewer.org/github/ofuhrer/icon4py_demo/blob/main/icon4py_demo.ipynb)
+
+The notebook includes selected outputs so the repository has a useful static
+preview. For local experimentation, run it in JupyterLab as described below.
+
+## Requirements
+
+- Python 3.10
+- A working C++ build toolchain for GT4Py/ICON4Py stencil compilation
+- Network access during installation, because ICON4Py packages are installed
+  from a pinned upstream Git commit
+
+The demo uses the published
+[`icon-grid-generator`](https://pypi.org/project/icon-grid-generator/) package
+from PyPI. The grid generator is developed in its own repository:
+[`ofuhrer/icon-grid-generator`](https://github.com/ofuhrer/icon-grid-generator).
+
+## Quickstart
+
+From this repository:
 
 ```bash
 python3.10 -m venv .venv
@@ -13,10 +46,6 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
-
-The demo installs `icon-grid-generator` from PyPI. The `packages/` directory is
-retained in this repository only as a development checkout for the standalone
-grid-generator package; the demo environment does not install from it.
 
 Registering the kernel is optional, but it makes the environment easy to select
 inside JupyterLab:
@@ -26,8 +55,6 @@ inside JupyterLab:
   --name icon4py-demo \
   --display-name "ICON4Py demo"
 ```
-
-## Running in a local JupyterLab
 
 Start JupyterLab from this directory:
 
@@ -42,12 +69,25 @@ jupyter lab \
   --PasswordIdentityProvider.hashed_password=''
 ```
 
-Then open `http://127.0.0.1:8888/lab` in your preferred browser and open the
-`icon4py_demo.ipynb` notebook. Select the `ICON4Py demo` kernel if needed.
+Then open `http://127.0.0.1:8888/lab` and select the `ICON4Py demo` kernel.
 
-### Testing
+## Validation
 
-For non-interactive validation, run:
+Run the lightweight checks used for development:
+
+```bash
+.venv/bin/ruff check icon4py_helper.py test_icon4py_helper.py test_notebook_hygiene.py
+.venv/bin/python -m pytest -q
+```
+
+The default pytest run skips expensive ICON4Py workflow checks. Run those
+explicitly when changing model setup or timestepping behavior:
+
+```bash
+.venv/bin/python -m pytest -q -m slow
+```
+
+For a non-interactive notebook execution check:
 
 ```bash
 mkdir -p /tmp/icon4py-demo-nbconvert
@@ -59,3 +99,23 @@ PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m nbconvert \
 ```
 
 This keeps execution counts and generated outputs out of the tracked notebook.
+
+## Notebook Hygiene
+
+The tracked notebook is expected to remain valid JSON, free of error outputs,
+and free of local machine paths. If you re-run cells locally, review the diff
+before committing. Generated execution artifacts such as `.gt4py_cache/`,
+`.pytest_cache/`, and `.ipynb_checkpoints/` are ignored.
+
+## Known Limitations
+
+- The first model step can spend significant time compiling GT4Py kernels.
+- The demo is intentionally small and educational; it is not a production ICON
+  configuration.
+- Cloud notebook services may time out or feel slow because of the build and
+  stencil compilation requirements.
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the local
+development workflow and notebook-output policy.

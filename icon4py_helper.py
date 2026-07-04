@@ -152,7 +152,7 @@ DEFAULT_CONFIG = {
     "ndyn_substeps": 5,
     "baroclinic_amplitude": 1.0,
     "log_level": "info",
-    "gt4py_cache_dir": str(PROJECT_ROOT / ".gt4py_cache"),
+    "gt4py_cache_dir": ".gt4py_cache",
     "gt4py_cache_lifetime": "persistent",
     "suppress_warnings": True,
 }
@@ -369,9 +369,15 @@ def configure_gt4py_cache(config, *, validate=True):
         config["gt4py_cache_lifetime"].upper()
     ]
 
+    display_cache_root = cache_root
+    try:
+        display_cache_root = pathlib.Path(".") / cache_root.relative_to(PROJECT_ROOT)
+    except ValueError:
+        pass
+
     log(
         config,
-        f"[cache] GT4Py build cache: {gt4py_config.BUILD_CACHE_DIR} "
+        f"[cache] GT4Py build cache: {display_cache_root} "
         f"({config['gt4py_cache_lifetime']})",
         level="info",
     )
