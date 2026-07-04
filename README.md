@@ -37,10 +37,8 @@ preview. For local experimentation, run it in JupyterLab as described below.
 From this repository:
 
 ```bash
-python3.10 -m venv .venv
+make install
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
 ```
 
 Registering the kernel is optional, but it makes the environment easy to select
@@ -72,26 +70,21 @@ Then open `http://127.0.0.1:8888/lab` and select the `ICON4Py demo` kernel.
 Run the lightweight checks used for development:
 
 ```bash
-.venv/bin/ruff check icon4py_helper.py scripts tests
-.venv/bin/python -m pytest -q
+make lint
+make test
 ```
 
 The default pytest run skips expensive ICON4Py workflow checks. Run those
 explicitly when changing model setup or timestepping behavior:
 
 ```bash
-.venv/bin/python -m pytest -q -m slow
+make test-slow
 ```
 
 For a non-interactive notebook execution check:
 
 ```bash
-mkdir -p /tmp/icon4py-demo-nbconvert
-PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m nbconvert \
-  --execute --to notebook \
-  --output-dir /tmp/icon4py-demo-nbconvert \
-  --output icon4py_demo.executed.ipynb \
-  icon4py_demo.ipynb
+make notebook-check
 ```
 
 This keeps execution counts and generated outputs out of the tracked notebook.
@@ -99,8 +92,23 @@ This keeps execution counts and generated outputs out of the tracked notebook.
 The README figure is generated from the same helper workflow as the notebook:
 
 ```bash
-.venv/bin/python scripts/generate_readme_figure.py
+make readme-figure
 ```
+
+## Dependency Maintenance
+
+`requirements.txt` is the installation entrypoint. It references
+`constraints.txt`, which pins the non-ICON support packages used by the demo.
+The ICON4Py packages are pinned to one upstream Git commit and should be updated
+together so the namespace subpackages stay compatible.
+
+When refreshing dependencies:
+
+1. Update `constraints.txt` for ordinary Python packages.
+2. Update every ICON4Py Git URL in `requirements.txt` to the same commit.
+3. Recreate the environment with `make install`.
+4. Run `make lint`, `make test`, and, when changing model setup behavior,
+   `make test-slow` or `make notebook-check`.
 
 ## Notebook Hygiene
 
