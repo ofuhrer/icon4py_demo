@@ -163,9 +163,32 @@ DEFAULT_PYTHON_GRID_OPTIONS = {
     "max_cells": 1_000_000,
     "radius": 1.0,
     "sphere_radius": 6_371_229.0,
+    "global_optimization": "none",
     "rotation_axis": (1.0, 0.0, 0.0),
     # Avoid exact coordinate degeneracies in ICON4Py interpolation weight setup.
     "rotation_angle_degrees": 0.05,
+}
+
+PYTHON_GRID_OPTION_OVERRIDES = {
+    "R02B03": {
+        "max_cells": None,
+        "sphere_radius": 6_371_229.0,
+        "global_optimization": {
+            "method": "spring",
+            "iterations": 180,
+            "dt": 0.04,
+            "friction": 0.8,
+            "spring_stiffness": 1.0,
+            "area_weight": 0.012,
+            "pentagon_stretch": 1.19,
+        },
+        "rotation_axis": (
+            0.008270451196684804,
+            -0.9999551677908659,
+            0.004611078544583483,
+        ),
+        "rotation_angle_degrees": 121.71965949833425,
+    },
 }
 
 LOG_LEVELS = {
@@ -611,13 +634,14 @@ class DisplayablePlotlyFigure:
 
 def create_python_grid(grid_name, options=None):
     """Create an icon4py helper-shaped grid dictionary entirely in Python."""
-    resolved = resolve_python_grid_options(options)
+    resolved = resolve_python_grid_options(options, grid_name=grid_name)
     generated = generate_grid(
         grid_name,
         options={
             "max_cells": resolved["max_cells"],
             "radius": resolved["radius"],
             "sphere_radius": resolved["sphere_radius"],
+            "global_optimization": resolved["global_optimization"],
             "rotation_axis": resolved["rotation_axis"],
             "rotation_angle_degrees": resolved["rotation_angle_degrees"],
         },
@@ -654,8 +678,10 @@ def create_python_grid(grid_name, options=None):
     )
 
 
-def resolve_python_grid_options(options):
+def resolve_python_grid_options(options, grid_name=None):
     resolved = dict(DEFAULT_PYTHON_GRID_OPTIONS)
+    if grid_name is not None:
+        resolved.update(PYTHON_GRID_OPTION_OVERRIDES.get(str(grid_name).upper(), {}))
     if options:
         resolved.update(options)
     if not isinstance(resolved["levels"], int) or resolved["levels"] < 2:

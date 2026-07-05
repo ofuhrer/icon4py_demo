@@ -120,6 +120,19 @@ def test_python_grid_options_apply_icon4py_rotation_workaround_by_default():
     assert options["rotation_angle_degrees"] == 0.05
 
 
+def test_r02b03_grid_options_apply_reference_optimization_and_rotation():
+    options = helper.resolve_python_grid_options(None, grid_name="R02B03")
+
+    assert options["max_cells"] is None
+    assert options["global_optimization"]["method"] == "spring"
+    assert options["global_optimization"]["iterations"] == 180
+    assert options["global_optimization"]["pentagon_stretch"] == pytest.approx(1.19)
+    assert options["rotation_axis"] == pytest.approx(
+        (0.008270451196684804, -0.9999551677908659, 0.004611078544583483)
+    )
+    assert options["rotation_angle_degrees"] == pytest.approx(121.71965949833425)
+
+
 def test_python_grid_rotation_avoids_icon4py_interpolation_weight_warnings():
     from grid_generator import generate_grid
     from icon4py.model.common.interpolation.interpolation_fields import (
