@@ -26,6 +26,7 @@ from icon4py_helper import (  # noqa: E402
 
 
 OUTPUT_PATH = PROJECT_ROOT / "docs" / "assets" / "temperature_evolution.png"
+GRID_NAME = "R02B03"
 
 
 def lonlat_to_xyz(lon_degrees, lat_degrees):
@@ -56,10 +57,10 @@ def level_temperature(snapshot, *, level):
 
 
 def run_simulation():
-    print("configuring README figure run", flush=True)
+    print(f"configuring README figure run for {GRID_NAME}", flush=True)
     config = check_config(
         {
-            "grid": "R02B02",
+            "grid": GRID_NAME,
             "backend": "gtfn_cpu",
             "levels": 10,
             "dtime_seconds": 120,

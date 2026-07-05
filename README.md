@@ -95,6 +95,9 @@ The README figure is generated from the same helper workflow as the notebook:
 make readme-figure
 ```
 
+The generated figure uses the `R02B03` grid and plots temperature anomalies as
+`day N - initial condition`.
+
 ## Dependency Maintenance
 
 `requirements.txt` is the installation entrypoint. It references
