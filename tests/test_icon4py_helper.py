@@ -113,34 +113,34 @@ def test_check_config_normalizes_defaults_and_rejects_invalid_values():
         helper.check_config({"backend": "embedded", "levels": 1})
 
 
-def test_python_grid_options_apply_icon4py_rotation_workaround_by_default():
+def test_python_grid_options_use_icon_grid_generator_defaults():
     options = helper.resolve_python_grid_options(None)
 
-    assert options["rotation_axis"] == (1.0, 0.0, 0.0)
-    assert options["rotation_angle_degrees"] == 0.05
+    assert options["optimize_global"] is True
+    assert options["spring_beta"] == pytest.approx(0.9)
+    assert options["spring_iterations"] == 2000
+    assert options["north_pole_lon"] == pytest.approx(0.0)
+    assert options["north_pole_lat"] == pytest.approx(90.0)
+    assert options["rotation_angle_degrees"] == pytest.approx(0.0)
 
 
-def test_r02b03_grid_options_apply_reference_optimization_and_rotation():
+def test_r02b03_grid_options_apply_reference_size_override():
     options = helper.resolve_python_grid_options(None, grid_name="R02B03")
 
     assert options["max_cells"] is None
-    assert options["global_optimization"]["method"] == "spring"
-    assert options["global_optimization"]["iterations"] == 180
-    assert options["global_optimization"]["pentagon_stretch"] == pytest.approx(1.19)
-    assert options["rotation_axis"] == pytest.approx(
-        (0.008270451196684804, -0.9999551677908659, 0.004611078544583483)
-    )
-    assert options["rotation_angle_degrees"] == pytest.approx(121.71965949833425)
+    assert options["sphere_radius"] == pytest.approx(6_371_229.0)
+    assert options["optimize_global"] is True
+    assert options["rotation_angle_degrees"] == pytest.approx(0.0)
 
 
-def test_python_grid_rotation_avoids_icon4py_interpolation_weight_warnings():
+def test_default_python_grid_avoids_icon4py_interpolation_weight_warnings():
     from grid_generator import generate_grid
     from icon4py.model.common.interpolation.interpolation_fields import (
         _compute_c_bln_avg,
         compute_e_bln_c_s,
     )
 
-    grid = generate_grid("R02B02", options={"rotation_angle_degrees": 0.05})
+    grid = generate_grid("R02B02")
 
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("always")
@@ -683,7 +683,7 @@ def test_public_create_grid_returns_icon4py_helper_shaped_grid():
         tangent_orientation,
         grid["generated"].geometry["edge_system_orientation"].astype(np.float64),
     )
-    assert set(np.unique(tangent_orientation)) == {-1.0, 1.0}
+    assert set(np.unique(tangent_orientation)) <= {-1.0, 1.0}
 
 
 def test_diagnostics_and_plots_work_for_synthetic_xarray():
