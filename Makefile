@@ -1,4 +1,4 @@
-PYTHON ?= python3.10
+PYTHON ?= python3.12
 VENV ?= .venv
 VENV_PYTHON := $(VENV)/bin/python
 VENV_PIP := $(VENV)/bin/pip

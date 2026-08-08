@@ -49,5 +49,5 @@ Before committing notebook changes:
 ## Dependency Updates
 
 Keep dependency changes explicit. `requirements.txt` is the user-facing install
-entry point, while `constraints.txt` pins key tools used by this demo. Keep all
-ICON4Py Git URLs pinned to the same upstream commit.
+entry point, while `constraints.txt` pins key tools used by this demo. Keep the
+ICON4Py root release and constrained GT4Py version compatible.

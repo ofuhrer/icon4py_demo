@@ -34,15 +34,22 @@ from icon4py.model.atmosphere.diffusion import diffusion
 from icon4py.model.atmosphere.dycore import solve_nonhydro
 from icon4py.model.common import (
     dimension as dims,
+    initial_condition,
     model_backends,
     model_options,
+    prescribed_tendencies,
     topography,
 )
 from icon4py.model.common.decomposition import definitions as decomp_defs
 from icon4py.model.common.grid import vertical as v_grid
+from icon4py.model.common.grid.geometry_config import GeometryConfig
 from icon4py.model.common.interpolation import (
     interpolation_attributes as intp_attr,
     interpolation_factory,
+)
+from icon4py.model.common.initial_condition import config as ic_config
+from icon4py.model.common.initial_condition.analytical import (
+    jablonowski_williamson as ic_jw,
 )
 from icon4py.model.common.metrics import (
     metrics_attributes as metrics_attr,
@@ -50,6 +57,7 @@ from icon4py.model.common.metrics import (
 )
 from icon4py.model.common.states import (
     diagnostic_state as diagnostics,
+    nonhydro_states,
     prognostic_state as prognostics,
     tracer_state,
 )
@@ -62,12 +70,7 @@ from icon4py.model.standalone_driver import (
     driver_io,
     driver_states,
     driver_utils,
-    initial_condition,
     standalone_driver,
-)
-from icon4py.model.standalone_driver.initial_condition import config as ic_config
-from icon4py.model.standalone_driver.initial_condition.analytical import (
-    jablonowski_williamson as ic_jw,
 )
 
 from grid_generator import generate_grid
@@ -104,6 +107,7 @@ class StateRuntime:
     vertical_grid: Any
     static_field_factories: Any
     prognostic_state_now: Any
+    solve_nonhydro_diagnostic_state: Any = None
     diagnostics_computer: Any = None
     driver: Any = None
     driver_states: Any = None
@@ -1066,8 +1070,10 @@ def initialize_static_context(grid, icon_config, config):
             allocator=runtime.allocator,
         ),
         backend=runtime.backend,
+        process_props=runtime.process_props,
         exchange=exchange,
         global_reductions=global_reductions,
+        geometry_config=icon_config.geometry,
         interpolation_config=icon_config.interpolation,
         metrics_config=icon_config.metrics,
     )
@@ -1191,6 +1197,7 @@ def build_icon4py_config(grid, state, testcase, config):
         )
 
     return driver_config.ExperimentConfig(
+        geometry=GeometryConfig(),
         metrics=metrics_factory.MetricsConfig(),
         interpolation=interpolation_factory.InterpolationConfig(),
         vertical_grid=_grid_runtime(grid).vertical_grid_config,
@@ -1202,12 +1209,13 @@ def build_icon4py_config(grid, state, testcase, config):
                 baroclinic_amplitude=config["baroclinic_amplitude"],
             )
         ),
-        driver=driver_config.DriverConfig(
+        prescribed_tendencies=prescribed_tendencies.PrescribedTendenciesConfig(),
+        driver=driver_config.DriverConfig.make_initial(
             experiment_name=f"{testcase.lower()}_{grid['kind'].lower()}",
-            profiling_stats=None,
+            profiling_options=None,
             dtime=dt.timedelta(seconds=config["dtime_seconds"]),
             start_of_simulation=dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc),
-            end_of_simulation=driver_config.NumTimeSteps(1),
+            end_of_simulation=1,
             enable_output=False,
             ndyn_substeps=config["ndyn_substeps"],
         ),
@@ -1241,6 +1249,14 @@ def init_state(grid, state, testcase="JW26", config=None):
         allocator=grid_runtime_value.allocator,
         tracer_config=icon_config.tracer_config,
     )
+    solve_nonhydro_diagnostic_state = (
+        nonhydro_states.initialize_solve_nonhydro_diagnostic_state(
+            grid=grid_runtime_value.icon_grid,
+            allocator=grid_runtime_value.allocator,
+        )
+        if icon_config.nonhydrostatic is not None
+        else None
+    )
 
     log(config, "[init] filling analytical Jablonowski-Williamson state")
     initial_condition.create(
@@ -1251,6 +1267,8 @@ def init_state(grid, state, testcase="JW26", config=None):
         prognostic_state_now=prognostic_state_now,
         backend=grid_runtime_value.backend,
         exchange=static_context["exchange"],
+        solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
+        global_reductions=static_context["global_reductions"],
     )
 
     state_runtime = StateRuntime(
@@ -1262,6 +1280,7 @@ def init_state(grid, state, testcase="JW26", config=None):
         vertical_grid=static_context["vertical_grid"],
         static_field_factories=static_context["static_field_factories"],
         prognostic_state_now=prognostic_state_now,
+        solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
     )
     state.runtime = state_runtime
     update_xarray_state(
@@ -1289,7 +1308,7 @@ def integrate_driver_steps(driver, driver_states_value, count):
     model_time_variables.n_time_steps = count
     driver.io_monitor = None
     try:
-        driver.time_integration(driver_states_value, do_prep_adv=False)
+        driver.time_integration(driver_states_value)
     finally:
         model_time_variables.n_time_steps = original_n_time_steps
         driver.io_monitor = original_io_monitor
@@ -1396,6 +1415,7 @@ def create_model(grid, state, config=None):
         prognostic_state_now=runtime.prognostic_state_now,
         diagnostic_state=diagnostic_state,
         experiment_config=icon_config,
+        solve_nonhydro_diagnostic_state=runtime.solve_nonhydro_diagnostic_state,
     )
     driver_utils.validate_granule_state_consistency(
         config=icon_config,

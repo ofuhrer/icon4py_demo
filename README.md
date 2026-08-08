@@ -1,7 +1,7 @@
 # ICON in Python Demo
 
 [![Tests](https://github.com/ofuhrer/icon4py_demo/actions/workflows/test.yml/badge.svg)](https://github.com/ofuhrer/icon4py_demo/actions/workflows/test.yml)
-[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 [![Notebook](https://img.shields.io/badge/notebook-nbviewer-orange.svg)](https://nbviewer.org/github/ofuhrer/icon4py_demo/blob/main/icon4py_demo.ipynb)
 
@@ -27,10 +27,9 @@ preview. For local experimentation, run it in JupyterLab as described below.
 
 ## Requirements
 
-- Python 3.10
+- Python 3.12
 - A working C++ build toolchain for GT4Py/ICON4Py stencil compilation
-- Network access during installation, because ICON4Py packages are installed
-  from a pinned upstream Git commit
+- Network access during installation to download the pinned PyPI releases
 
 ## Quickstart
 
@@ -102,13 +101,12 @@ The generated figure uses the `R02B03` grid and plots temperature anomalies as
 
 `requirements.txt` is the installation entrypoint. It references
 `constraints.txt`, which pins the non-ICON support packages used by the demo.
-The ICON4Py packages are pinned to one upstream Git commit and should be updated
-together so the namespace subpackages stay compatible.
+The root ICON4Py release installs a compatible set of namespace subpackages.
 
 When refreshing dependencies:
 
 1. Update `constraints.txt` for ordinary Python packages.
-2. Update every ICON4Py Git URL in `requirements.txt` to the same commit.
+2. Update the ICON4Py release pin in `requirements.txt`.
 3. Recreate the environment with `make install`.
 4. Run `make lint`, `make test`, and, when changing model setup behavior,
    `make test-slow` or `make notebook-check`.

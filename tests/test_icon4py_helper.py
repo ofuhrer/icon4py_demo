@@ -279,10 +279,10 @@ def test_integrate_driver_steps_uses_public_driver_method_and_restores_monitor()
             self.io_monitor = object()
             self.calls = []
 
-        def time_integration(self, driver_states_value, do_prep_adv):
+        def time_integration(self, driver_states_value):
             assert self.model_time_variables.n_time_steps == 7
             assert self.io_monitor is None
-            self.calls.append((driver_states_value, do_prep_adv))
+            self.calls.append(driver_states_value)
 
         def _integrate_one_time_step(self, **kwargs):
             raise AssertionError("private timestep API must not be called")
@@ -293,7 +293,7 @@ def test_integrate_driver_steps_uses_public_driver_method_and_restores_monitor()
 
     helper.integrate_driver_steps(driver, driver_states_value, 7)
 
-    assert driver.calls == [(driver_states_value, False)]
+    assert driver.calls == [driver_states_value]
     assert driver.model_time_variables.n_time_steps == 12
     assert driver.io_monitor is original_monitor
 
@@ -364,6 +364,7 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
         "static_field_factories": static_fields,
     }
     prognostic_state = object()
+    solve_nonhydro_diagnostic_state = object()
     grid = helper.IconGrid(
         {
             "kind": "R02B04",
@@ -395,6 +396,10 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     def fake_initial_condition_create(**kwargs):
         calls["initial_condition_create"] = kwargs
 
+    def fake_initialize_solve_nonhydro_diagnostic_state(**kwargs):
+        calls["initialize_solve_nonhydro_diagnostic_state"] = kwargs
+        return solve_nonhydro_diagnostic_state
+
     def fake_update_xarray_state(state_arg, prognostic_arg, simulation_datetime):
         calls["update_xarray_state"] = (state_arg, prognostic_arg, simulation_datetime)
         state_arg["xarray"] = xr.Dataset()
@@ -413,6 +418,11 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     monkeypatch.setattr(
         helper.initial_condition, "create", fake_initial_condition_create
     )
+    monkeypatch.setattr(
+        helper.nonhydro_states,
+        "initialize_solve_nonhydro_diagnostic_state",
+        fake_initialize_solve_nonhydro_diagnostic_state,
+    )
     monkeypatch.setattr(helper, "update_xarray_state", fake_update_xarray_state)
 
     helper.init_state(grid, state, "JW26", config)
@@ -429,6 +439,15 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     assert calls["initial_condition_create"]["static_fields"] is static_fields
     assert calls["initial_condition_create"]["backend"] is backend
     assert calls["initial_condition_create"]["exchange"] is exchange
+    assert (
+        calls["initial_condition_create"]["solve_nonhydro_diagnostic_state"]
+        is solve_nonhydro_diagnostic_state
+    )
+    assert (
+        calls["initial_condition_create"]["global_reductions"]
+        is static_context["global_reductions"]
+    )
+    assert runtime.solve_nonhydro_diagnostic_state is solve_nonhydro_diagnostic_state
     assert runtime.driver is None
     assert runtime.static_field_factories is static_fields
 
@@ -441,6 +460,7 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
     icon_grid = object()
     diagnostic_state = object()
     prognostic_state = object()
+    solve_nonhydro_diagnostic_state = object()
     static_fields = object()
     driver_states_value = SimpleNamespace(
         prognostics=SimpleNamespace(current=object()),
@@ -480,6 +500,7 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
             vertical_grid=object(),
             static_field_factories=object(),
             prognostic_state_now=prognostic_state,
+            solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
         ),
     )
     calls = {}
@@ -539,6 +560,10 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
     assert calls["assemble_driver_states"]["static_fields"] is static_fields
     assert calls["assemble_driver_states"]["prognostic_state_now"] is prognostic_state
     assert calls["assemble_driver_states"]["diagnostic_state"] is diagnostic_state
+    assert (
+        calls["assemble_driver_states"]["solve_nonhydro_diagnostic_state"]
+        is solve_nonhydro_diagnostic_state
+    )
     assert (
         calls["validate_granule_state_consistency"]["granules"] is icon_driver.granules
     )
