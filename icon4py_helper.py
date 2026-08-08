@@ -38,7 +38,6 @@ from icon4py.model.common import (
     model_backends,
     model_options,
     prescribed_tendencies,
-    topography,
 )
 from icon4py.model.common.decomposition import definitions as decomp_defs
 from icon4py.model.common.grid import vertical as v_grid
@@ -100,16 +99,10 @@ class InMemoryGridManager:
 @dataclass
 class StateRuntime:
     grid: dict
-    icon_config: Any
-    decomposition_info: Any
-    exchange: Any
-    global_reductions: Any
-    vertical_grid: Any
-    static_field_factories: Any
+    driver: Any
     prognostic_state_now: Any
     solve_nonhydro_diagnostic_state: Any = None
     diagnostics_computer: Any = None
-    driver: Any = None
     driver_states: Any = None
     step_count: int = 0
 
@@ -1036,64 +1029,14 @@ def update_public_state_fields(state, driver_states_value):
     update_public_prognostic_fields(state, driver_states_value.prognostics.current)
 
 
-def initialize_static_context(grid, icon_config, config):
-    """Build static fields needed by the analytical state initializer."""
-    log(config, "[init] creating exchange/reduction runtimes")
-    runtime = _grid_runtime(grid)
-    decomposition_info = runtime.manager.decomposition_info
-    exchange = decomp_defs.create_exchange(runtime.process_props, decomposition_info)
-    global_reductions = decomp_defs.create_reduction(
-        runtime.process_props, decomposition_info
-    )
-
-    log(
-        config,
-        "[init] creating vertical grid, topography, metrics, and interpolation fields",
-    )
-    vertical_grid = driver_utils.create_vertical_grid(
-        vertical_grid_config=icon_config.vertical_grid,
-        allocator=runtime.allocator,
-    )
-    cell_topography = topography.create(
-        config=icon_config.topography,
-        grid_manager=runtime.manager,
-        backend=runtime.backend,
-        exchange=exchange,
-    )
-    static_field_factories = driver_utils.create_static_field_factories(
-        grid_manager=runtime.manager,
-        decomposition_info=decomposition_info,
-        vertical_grid=vertical_grid,
-        cell_topography=gtx.as_field(
-            (dims.CellDim,),
-            data=cell_topography,
-            allocator=runtime.allocator,
-        ),
-        backend=runtime.backend,
-        process_props=runtime.process_props,
-        exchange=exchange,
-        global_reductions=global_reductions,
-        geometry_config=icon_config.geometry,
-        interpolation_config=icon_config.interpolation,
-        metrics_config=icon_config.metrics,
-    )
-    return {
-        "decomposition_info": decomposition_info,
-        "exchange": exchange,
-        "global_reductions": global_reductions,
-        "vertical_grid": vertical_grid,
-        "static_field_factories": static_field_factories,
-    }
-
-
 def build_xarray_state(state, prognostic_state, simulation_datetime):
     """Build current prognostic fields plus derived diagnostics as one xarray dataset."""
     runtime = _state_runtime(state)
-    static_fields = runtime.static_field_factories
+    icon_driver = runtime.driver
+    static_fields = icon_driver.static_field_factories
     if runtime.diagnostics_computer is None:
-        grid_runtime_value = _grid_runtime(runtime.grid)
         runtime.diagnostics_computer = driver_io.DiagnosticsComputer(
-            grid=grid_runtime_value.icon_grid, backend=grid_runtime_value.backend
+            grid=icon_driver.grid, backend=icon_driver.backend
         )
     output_state = driver_io.prognostic_state_to_dataarrays(prognostic_state)
     diagnostic_fields = runtime.diagnostics_computer.compute(
@@ -1234,24 +1177,31 @@ def init_state(grid, state, testcase="JW26", config=None):
     icon_config = build_icon4py_config(grid, state, testcase, config)
     grid_runtime_value = _grid_runtime(grid)
 
-    log(config, "[init] preparing static grid context for analytical JW state")
+    log(config, "[init] initializing ICON4Py driver context")
     log(
         config,
-        "[init] GT4Py setup kernels may compile here because interpolation, metrics, "
+        "[init] GT4Py setup kernels may compile here because driver, static-field, "
         "and initial-condition operators are real stencils",
         level="debug",
     )
-    static_context = initialize_static_context(grid, icon_config, config)
+    icon_driver = standalone_driver.initialize_driver(
+        config=icon_config,
+        grid_manager=grid_runtime_value.manager,
+        process_props=grid_runtime_value.process_props,
+        backend=grid_runtime_value.backend,
+    )
+    remove_disabled_output_directory(icon_driver)
+    icon_config = icon_driver.config
 
     log(config, "[init] allocating prognostic fields: rho, theta_v, exner, vn, w")
     prognostic_state_now = prognostics.initialize_prognostic_state(
-        grid=grid_runtime_value.icon_grid,
+        grid=icon_driver.grid,
         allocator=grid_runtime_value.allocator,
         tracer_config=icon_config.tracer_config,
     )
     solve_nonhydro_diagnostic_state = (
         nonhydro_states.initialize_solve_nonhydro_diagnostic_state(
-            grid=grid_runtime_value.icon_grid,
+            grid=icon_driver.grid,
             allocator=grid_runtime_value.allocator,
         )
         if icon_config.nonhydrostatic is not None
@@ -1262,23 +1212,18 @@ def init_state(grid, state, testcase="JW26", config=None):
     initial_condition.create(
         config=icon_config.initial_condition,
         vertical_config=icon_config.vertical_grid,
-        grid=grid_runtime_value.icon_grid,
-        static_fields=static_context["static_field_factories"],
+        grid=icon_driver.grid,
+        static_fields=icon_driver.static_field_factories,
         prognostic_state_now=prognostic_state_now,
-        backend=grid_runtime_value.backend,
-        exchange=static_context["exchange"],
+        backend=icon_driver.backend,
+        exchange=icon_driver.exchange,
         solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
-        global_reductions=static_context["global_reductions"],
+        global_reductions=icon_driver.global_reductions,
     )
 
     state_runtime = StateRuntime(
         grid=grid,
-        icon_config=icon_config,
-        decomposition_info=static_context["decomposition_info"],
-        exchange=static_context["exchange"],
-        global_reductions=static_context["global_reductions"],
-        vertical_grid=static_context["vertical_grid"],
-        static_field_factories=static_context["static_field_factories"],
+        driver=icon_driver,
         prognostic_state_now=prognostic_state_now,
         solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
     )
@@ -1297,11 +1242,6 @@ def init_state(grid, state, testcase="JW26", config=None):
 
 def integrate_driver_steps(driver, driver_states_value, count):
     """Advance ICON4Py through its public integration hook for `count` timesteps."""
-    if not hasattr(driver, "time_integration"):
-        raise RuntimeError(
-            "The installed ICON4Py driver does not expose time_integration()."
-        )
-
     model_time_variables = driver.model_time_variables
     original_n_time_steps = model_time_variables.n_time_steps
     original_io_monitor = getattr(driver, "io_monitor", None)
@@ -1387,19 +1327,7 @@ def create_model(grid, state, config=None):
     runtime = _state_runtime(state)
     grid_runtime_value = _grid_runtime(grid)
     icon_driver = runtime.driver
-    if icon_driver is None:
-        log(config, "[model] initializing ICON4Py dycore/diffusion")
-        icon_driver = standalone_driver.initialize_driver(
-            config=runtime.icon_config,
-            grid_manager=grid_runtime_value.manager,
-            process_props=grid_runtime_value.process_props,
-            backend=grid_runtime_value.backend,
-        )
-        remove_disabled_output_directory(icon_driver)
-        runtime.driver = icon_driver
-    runtime.icon_config = icon_driver.config
-    runtime.static_field_factories = icon_driver.static_field_factories
-    icon_config = runtime.icon_config
+    icon_config = icon_driver.config
 
     log(config, "[model] assembling time-step state", level="debug")
     diagnostic_state = diagnostics.initialize_diagnostic_state(

@@ -349,22 +349,26 @@ def test_build_icon4py_config_uses_positive_internal_timesteps():
     assert time_variables.n_time_steps == 1
 
 
-def test_init_state_builds_static_context_without_initializing_driver(monkeypatch):
+def test_init_state_initializes_driver_once_and_reuses_its_context(monkeypatch):
     config = quiet_config()
     icon_grid = object()
     allocator = object()
     backend = object()
     static_fields = object()
     exchange = object()
-    static_context = {
-        "decomposition_info": object(),
-        "exchange": exchange,
-        "global_reductions": object(),
-        "vertical_grid": object(),
-        "static_field_factories": static_fields,
-    }
+    global_reductions = object()
+    manager = object()
+    process_props = object()
     prognostic_state = object()
     solve_nonhydro_diagnostic_state = object()
+    icon_driver = SimpleNamespace(
+        config=None,
+        grid=icon_grid,
+        backend=backend,
+        exchange=exchange,
+        global_reductions=global_reductions,
+        static_field_factories=static_fields,
+    )
     grid = helper.IconGrid(
         {
             "kind": "R02B04",
@@ -374,6 +378,8 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
             backend=backend,
             allocator=allocator,
             icon_grid=icon_grid,
+            manager=manager,
+            process_props=process_props,
             vertical_grid_config=helper.v_grid.VerticalGridConfig(
                 num_levels=config["levels"]
             ),
@@ -382,12 +388,13 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     state = helper.IconState({"tracers": {}})
     calls = {}
 
-    def fail_initialize_driver(**kwargs):
-        raise AssertionError("init_state must not initialize dycore/diffusion")
+    def fake_initialize_driver(**kwargs):
+        calls["initialize_driver"] = kwargs
+        icon_driver.config = kwargs["config"]
+        return icon_driver
 
-    def fake_initialize_static_context(*args):
-        calls["initialize_static_context"] = args
-        return static_context
+    def fake_remove_disabled_output_directory(driver):
+        calls["remove_disabled_output_directory"] = driver
 
     def fake_initialize_prognostic_state(**kwargs):
         calls["initialize_prognostic_state"] = kwargs
@@ -405,10 +412,10 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
         state_arg["xarray"] = xr.Dataset()
 
     monkeypatch.setattr(
-        helper.standalone_driver, "initialize_driver", fail_initialize_driver
+        helper.standalone_driver, "initialize_driver", fake_initialize_driver
     )
     monkeypatch.setattr(
-        helper, "initialize_static_context", fake_initialize_static_context
+        helper, "remove_disabled_output_directory", fake_remove_disabled_output_directory
     )
     monkeypatch.setattr(
         helper.prognostics,
@@ -428,12 +435,17 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     helper.init_state(grid, state, "JW26", config)
 
     runtime = state.runtime
-    assert calls["initialize_static_context"][0] is grid
-    assert calls["initialize_static_context"][2] == config
+    assert calls["initialize_driver"] == {
+        "config": icon_driver.config,
+        "grid_manager": manager,
+        "process_props": process_props,
+        "backend": backend,
+    }
+    assert calls["remove_disabled_output_directory"] is icon_driver
     assert calls["initialize_prognostic_state"] == {
         "grid": icon_grid,
         "allocator": allocator,
-        "tracer_config": runtime.icon_config.tracer_config,
+        "tracer_config": icon_driver.config.tracer_config,
     }
     assert calls["initial_condition_create"]["grid"] is icon_grid
     assert calls["initial_condition_create"]["static_fields"] is static_fields
@@ -445,16 +457,13 @@ def test_init_state_builds_static_context_without_initializing_driver(monkeypatc
     )
     assert (
         calls["initial_condition_create"]["global_reductions"]
-        is static_context["global_reductions"]
+        is global_reductions
     )
     assert runtime.solve_nonhydro_diagnostic_state is solve_nonhydro_diagnostic_state
-    assert runtime.driver is None
-    assert runtime.static_field_factories is static_fields
+    assert runtime.driver is icon_driver
 
 
-def test_create_model_initializes_driver_and_removes_disabled_output_dir(
-    monkeypatch, tmp_path
-):
+def test_create_model_reuses_initialized_driver_and_assembles_states(monkeypatch):
     config = quiet_config()
     allocator = object()
     icon_grid = object()
@@ -465,10 +474,7 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
     driver_states_value = SimpleNamespace(
         prognostics=SimpleNamespace(current=object()),
     )
-    output_path = tmp_path / "output"
-    icon_config = SimpleNamespace(
-        driver=SimpleNamespace(enable_output=False, output_path=output_path),
-    )
+    icon_config = object()
     icon_driver = SimpleNamespace(
         config=icon_config,
         grid=icon_grid,
@@ -493,22 +499,15 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
         {"xarray": None},
         runtime=helper.StateRuntime(
             grid=grid,
-            icon_config=icon_config,
-            decomposition_info=object(),
-            exchange=object(),
-            global_reductions=object(),
-            vertical_grid=object(),
-            static_field_factories=object(),
+            driver=icon_driver,
             prognostic_state_now=prognostic_state,
             solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
         ),
     )
     calls = {}
 
-    def fake_initialize_driver(**kwargs):
-        calls["initialize_driver"] = kwargs
-        output_path.mkdir()
-        return icon_driver
+    def fail_initialize_driver(**kwargs):
+        raise AssertionError("create_model must reuse the driver from init_state")
 
     def fake_initialize_diagnostic_state(**kwargs):
         calls["initialize_diagnostic_state"] = kwargs
@@ -522,7 +521,7 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
         calls["validate_granule_state_consistency"] = kwargs
 
     monkeypatch.setattr(
-        helper.standalone_driver, "initialize_driver", fake_initialize_driver
+        helper.standalone_driver, "initialize_driver", fail_initialize_driver
     )
     monkeypatch.setattr(
         helper.diagnostics,
@@ -541,13 +540,6 @@ def test_create_model_initializes_driver_and_removes_disabled_output_dir(
     model = helper.create_model(grid, state, config)
 
     assert model.driver is icon_driver
-    assert calls["initialize_driver"] == {
-        "config": icon_config,
-        "grid_manager": grid.runtime.manager,
-        "process_props": grid.runtime.process_props,
-        "backend": grid.runtime.backend,
-    }
-    assert not output_path.exists()
     assert state.runtime.driver_states is driver_states_value
     assert calls["initialize_diagnostic_state"] == {
         "grid": icon_grid,
