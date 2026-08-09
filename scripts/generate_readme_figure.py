@@ -6,12 +6,10 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 
-
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -23,7 +21,6 @@ from icon4py_helper import (  # noqa: E402
     create_state,
     init_state,
 )
-
 
 OUTPUT_PATH = PROJECT_ROOT / "docs" / "assets" / "temperature_evolution.png"
 GRID_NAME = "R02B03"
@@ -42,7 +39,9 @@ def lonlat_to_xyz(lon_degrees, lat_degrees):
 def orthographic_project(lon_degrees, lat_degrees, *, center_lon=15.0, center_lat=20.0):
     xyz = lonlat_to_xyz(lon_degrees, lat_degrees)
     center = lonlat_to_xyz(center_lon, center_lat)
-    east = np.array([-np.sin(np.radians(center_lon)), np.cos(np.radians(center_lon)), 0.0])
+    east = np.array(
+        [-np.sin(np.radians(center_lon)), np.cos(np.radians(center_lon)), 0.0]
+    )
     north = np.cross(center, east)
 
     x = np.tensordot(xyz, east, axes=([-1], [0]))
@@ -52,7 +51,9 @@ def orthographic_project(lon_degrees, lat_degrees, *, center_lon=15.0, center_la
 
 
 def level_temperature(snapshot, *, level):
-    level_dim = "full_level" if "full_level" in snapshot["temperature"].dims else "level"
+    level_dim = (
+        "full_level" if "full_level" in snapshot["temperature"].dims else "level"
+    )
     return snapshot["temperature"].isel({level_dim: level}).values
 
 

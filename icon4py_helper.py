@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 
 venv_bin = PROJECT_ROOT / ".venv" / "bin"
@@ -26,14 +25,14 @@ import gt4py.next as gtx
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
+from grid_generator import generate_grid
 from gt4py.next import config as gt4py_config
-from matplotlib import colors as matplotlib_colors
-from matplotlib.collections import PolyCollection
-
 from icon4py.model.atmosphere.diffusion import diffusion
 from icon4py.model.atmosphere.dycore import solve_nonhydro
 from icon4py.model.common import (
     dimension as dims,
+)
+from icon4py.model.common import (
     initial_condition,
     model_backends,
     model_options,
@@ -42,23 +41,31 @@ from icon4py.model.common import (
 from icon4py.model.common.decomposition import definitions as decomp_defs
 from icon4py.model.common.grid import vertical as v_grid
 from icon4py.model.common.grid.geometry_config import GeometryConfig
-from icon4py.model.common.interpolation import (
-    interpolation_attributes as intp_attr,
-    interpolation_factory,
-)
 from icon4py.model.common.initial_condition import config as ic_config
 from icon4py.model.common.initial_condition.analytical import (
     jablonowski_williamson as ic_jw,
 )
+from icon4py.model.common.interpolation import (
+    interpolation_attributes as intp_attr,
+)
+from icon4py.model.common.interpolation import (
+    interpolation_factory,
+)
 from icon4py.model.common.metrics import (
     metrics_attributes as metrics_attr,
+)
+from icon4py.model.common.metrics import (
     metrics_factory,
 )
 from icon4py.model.common.states import (
     diagnostic_state as diagnostics,
+)
+from icon4py.model.common.states import (
     nonhydro_states,
-    prognostic_state as prognostics,
     tracer_state,
+)
+from icon4py.model.common.states import (
+    prognostic_state as prognostics,
 )
 from icon4py.model.common.topography import config as topo_config
 from icon4py.model.common.topography.analytical import (
@@ -66,13 +73,17 @@ from icon4py.model.common.topography.analytical import (
 )
 from icon4py.model.standalone_driver import (
     config as driver_config,
+)
+from icon4py.model.standalone_driver import (
     driver_io,
     driver_states,
     driver_utils,
     standalone_driver,
 )
+from matplotlib import colors as matplotlib_colors
+from matplotlib.collections import PolyCollection
 
-from grid_generator import generate_grid
+from icon4py_compat import derive_neighbor_tables
 
 
 @dataclass(frozen=True)
@@ -468,15 +479,6 @@ def vertical_level_distribution(vertical_grid_config, allocator):
     )
 
 
-def unwrap_cell_vertex_longitudes(cell_vertex_lon, cell_lon):
-    """Keep each triangular cell local in longitude for plotting near the dateline."""
-    unwrapped = np.array(cell_vertex_lon, copy=True)
-    center = np.asarray(cell_lon)[:, np.newaxis]
-    unwrapped = np.where(unwrapped - center > 180.0, unwrapped - 360.0, unwrapped)
-    unwrapped = np.where(unwrapped - center < -180.0, unwrapped + 360.0, unwrapped)
-    return unwrapped
-
-
 def normalize_polar_vertex_longitudes(cell_vertex_lon, cell_vertex_lat, cell_lon):
     """Move arbitrary pole longitudes to the cell center longitude for lon/lat plotting."""
     normalized = np.array(cell_vertex_lon, copy=True)
@@ -714,7 +716,7 @@ def _create_decomposition_info(generated: Any, allocator):
 
 
 def _create_icon_grid(generated: Any, backend_runtime, decomposition_info, options):
-    from icon4py.model.common.grid import base, grid_manager, grid_refinement, icon
+    from icon4py.model.common.grid import base, grid_refinement, icon
 
     horizontal_size = base.HorizontalGridSize(
         num_vertices=generated.dims["vertex"],
@@ -731,8 +733,7 @@ def _create_icon_grid(generated: Any, backend_runtime, decomposition_info, optio
         )
     )
     neighbor_tables = python_grid_neighbor_tables(generated)
-    # ICON4Py currently derives secondary connectivities through an internal helper.
-    neighbor_tables.update(grid_manager._get_derived_connectivities(neighbor_tables))
+    neighbor_tables.update(derive_neighbor_tables(neighbor_tables))
     return icon.icon_grid(
         id_=generated.metadata["uuidOfHGrid"],
         allocator=allocator,
@@ -1003,7 +1004,7 @@ def create_state(grid, config, tracers=None):
 
 def prepare_current_xarray_state(fields, simulation_datetime, step_count=None):
     timestamp = np.datetime64(
-        simulation_datetime.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        simulation_datetime.astimezone(dt.UTC).replace(tzinfo=None)
     )
     current = xr.Dataset(
         {name: array.copy(deep=True) for name, array in fields.items()}
@@ -1157,7 +1158,7 @@ def build_icon4py_config(grid, state, testcase, config):
             experiment_name=f"{testcase.lower()}_{grid['kind'].lower()}",
             profiling_options=None,
             dtime=dt.timedelta(seconds=config["dtime_seconds"]),
-            start_of_simulation=dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc),
+            start_of_simulation=dt.datetime(2000, 1, 1, tzinfo=dt.UTC),
             end_of_simulation=1,
             enable_output=False,
             ndyn_substeps=config["ndyn_substeps"],

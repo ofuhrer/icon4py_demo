@@ -5,6 +5,9 @@ name: Test
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -16,7 +19,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -39,7 +42,53 @@ jobs:
           PY
 
       - name: Ruff
-        run: python -m ruff check icon4py_helper.py scripts tests
+        run: make lint
 
       - name: Tests
         run: python -m pytest -q
+
+  compiled-jw:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate compiled JW result against the reference
+        run: make test-slow
+
+  notebook:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Execute the demo notebook
+        run: make notebook-check

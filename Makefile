@@ -3,7 +3,7 @@ VENV ?= .venv
 VENV_PYTHON := $(VENV)/bin/python
 VENV_PIP := $(VENV)/bin/pip
 
-.PHONY: venv install lint test test-slow notebook-check readme-figure clean
+.PHONY: venv install lint test test-slow notebook-check notebook-compact readme-figure clean
 
 venv:
 	$(PYTHON) -m venv $(VENV)
@@ -13,7 +13,8 @@ install: venv
 	$(VENV_PIP) install -r requirements.txt
 
 lint:
-	$(VENV_PYTHON) -m ruff check icon4py_helper.py scripts tests
+	$(VENV_PYTHON) -m ruff check *.py scripts tests
+	$(VENV_PYTHON) -m ruff format --check *.py scripts tests
 
 test:
 	$(VENV_PYTHON) -m pytest -q
@@ -28,6 +29,9 @@ notebook-check:
 		--output-dir /tmp/icon4py-demo-nbconvert \
 		--output icon4py_demo.executed.ipynb \
 		icon4py_demo.ipynb
+
+notebook-compact:
+	$(VENV_PYTHON) scripts/compact_notebook.py icon4py_demo.ipynb
 
 readme-figure:
 	$(VENV_PYTHON) scripts/generate_readme_figure.py

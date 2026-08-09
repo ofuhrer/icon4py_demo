@@ -57,12 +57,12 @@ export PATH="$PWD/.venv/bin:$PATH"
 jupyter lab \
   --ip 127.0.0.1 \
   --port 8888 \
-  --no-browser \
-  --IdentityProvider.token='' \
-  --PasswordIdentityProvider.hashed_password=''
+  --no-browser
 ```
 
-Then open `http://127.0.0.1:8888/lab` and select the `ICON4Py demo` kernel.
+Open the tokenized URL printed by JupyterLab and select the `ICON4Py demo` kernel.
+Keeping the generated access token enabled makes the same command safe if the
+listening address is changed later.
 
 ## Validation
 
@@ -73,8 +73,10 @@ make lint
 make test
 ```
 
-The default pytest run skips expensive ICON4Py workflow checks. Run those
-explicitly when changing model setup or timestepping behavior:
+The default pytest run skips the expensive compiled ICON4Py workflow check.
+Run it explicitly when changing model setup or timestepping behavior; it
+integrates the coarse JW case for one simulated day and compares numerical
+field statistics with the checked reference:
 
 ```bash
 make test-slow
@@ -86,7 +88,13 @@ For a non-interactive notebook execution check:
 make notebook-check
 ```
 
-This keeps execution counts and generated outputs out of the tracked notebook.
+This writes the executed copy under `/tmp`, leaving the tracked notebook unchanged.
+After intentionally refreshing its representative outputs, remove duplicated
+interactive/static plot payloads with `make notebook-compact`.
+
+GitHub Actions runs lint and fast tests for pushes and pull requests. A weekly
+schedule, also available through manual dispatch, runs the compiled JW reference
+check and executes the complete notebook in separate jobs.
 
 The README figure is generated from the same helper workflow as the notebook:
 
@@ -114,7 +122,9 @@ When refreshing dependencies:
 ## Notebook Hygiene
 
 The tracked notebook is expected to remain valid JSON, free of error outputs,
-and free of local machine paths. If you re-run cells locally, review the diff
+free of local machine paths, and small enough to review. It retains static
+figures for readers; rerunning the cells restores the interactive Plotly views.
+If you re-run cells locally, use `make notebook-compact` and review the diff
 before committing. Generated execution artifacts such as `.gt4py_cache/`,
 `.pytest_cache/`, and `.ipynb_checkpoints/` are ignored.
 

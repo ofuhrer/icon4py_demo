@@ -12,12 +12,12 @@ import pytest
 import xarray as xr
 from matplotlib.collections import PolyCollection
 
-
 matplotlib.use("Agg")
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
 
 import icon4py_helper as helper
+from icon4py_compat import DERIVED_CONNECTIVITY_OFFSETS, derive_neighbor_tables
 
 
 def quiet_config(**overrides):
@@ -122,6 +122,23 @@ def test_python_grid_options_use_icon_grid_generator_defaults():
     assert options["north_pole_lon"] == pytest.approx(0.0)
     assert options["north_pole_lat"] == pytest.approx(90.0)
     assert options["rotation_angle_degrees"] == pytest.approx(0.0)
+
+
+def test_icon4py_derived_connectivity_compatibility_contract():
+    from grid_generator import generate_grid
+
+    generated = generate_grid("R01B00")
+    derived = derive_neighbor_tables(helper.python_grid_neighbor_tables(generated))
+
+    assert set(derived) == DERIVED_CONNECTIVITY_OFFSETS
+    assert {offset.value: table.shape for offset, table in derived.items()} == {
+        "C2E2CO": (20, 4),
+        "C2E2C2E": (20, 9),
+        "C2E2C2E2C": (20, 9),
+        "E2C2V": (30, 4),
+        "E2C2E": (30, 4),
+        "E2C2EO": (30, 5),
+    }
 
 
 def test_r02b03_grid_options_apply_reference_size_override():
@@ -301,7 +318,7 @@ def test_integrate_driver_steps_uses_public_driver_method_and_restores_monitor()
 def test_prepare_current_xarray_state_adds_time_and_step_metadata():
     current = helper.prepare_current_xarray_state(
         {"rho": xr.DataArray(np.array([1.0, 2.0]), dims=("cell",))},
-        dt.datetime(2000, 1, 1, 0, 2, tzinfo=dt.timezone.utc),
+        dt.datetime(2000, 1, 1, 0, 2, tzinfo=dt.UTC),
         step_count=3,
     )
 
@@ -415,7 +432,9 @@ def test_init_state_initializes_driver_once_and_reuses_its_context(monkeypatch):
         helper.standalone_driver, "initialize_driver", fake_initialize_driver
     )
     monkeypatch.setattr(
-        helper, "remove_disabled_output_directory", fake_remove_disabled_output_directory
+        helper,
+        "remove_disabled_output_directory",
+        fake_remove_disabled_output_directory,
     )
     monkeypatch.setattr(
         helper.prognostics,
@@ -455,10 +474,7 @@ def test_init_state_initializes_driver_once_and_reuses_its_context(monkeypatch):
         calls["initial_condition_create"]["solve_nonhydro_diagnostic_state"]
         is solve_nonhydro_diagnostic_state
     )
-    assert (
-        calls["initial_condition_create"]["global_reductions"]
-        is global_reductions
-    )
+    assert calls["initial_condition_create"]["global_reductions"] is global_reductions
     assert runtime.solve_nonhydro_diagnostic_state is solve_nonhydro_diagnostic_state
     assert runtime.driver is icon_driver
 
@@ -562,7 +578,7 @@ def test_create_model_reuses_initialized_driver_and_assembles_states(monkeypatch
 
 
 @pytest.mark.slow
-def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
+def test_compiled_notebook_workflow_matches_one_day_jw_reference(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     config = helper.check_config(
         {
@@ -574,6 +590,9 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
             "baroclinic_amplitude": 1.0,
             "log_level": "quiet",
             "suppress_warnings": True,
+            "gt4py_cache_dir": str(
+                pathlib.Path(helper.__file__).parent / ".gt4py_cache"
+            ),
         }
     )
     plot_level = config["levels"] // 2
@@ -627,16 +646,49 @@ def test_notebook_public_workflow_smoke_on_small_grid(monkeypatch, tmp_path):
     model = helper.create_model(grid, state, config)
     diagnostics = []
     daily_states = [state["xarray"].copy(deep=True)]
-    steps_to_run = 1
+    steps_to_run = round(24 * 60 * 60 / config["dtime_seconds"])
 
-    for _step in range(1, steps_to_run + 1):
-        model.step(grid, state, count=1, diagnostics=diagnostics)
-        daily_states.append(state["xarray"].copy(deep=True))
+    model.step(grid, state, count=steps_to_run, diagnostics=diagnostics)
+    daily_states.append(state["xarray"].copy(deep=True))
 
     assert len(daily_states) == 2
     assert len(diagnostics) == 1
-    assert diagnostics[0]["step"] == 1
+    assert diagnostics[0]["step"] == steps_to_run
+    assert daily_states[-1].time.values == np.datetime64("2000-01-02T00:00:00")
     assert not list(tmp_path.glob("output*"))
+
+    # ICON4Py 0.3.0 and icon-grid-generator 0.4.1 reference on R01B01.
+    reference_statistics = {
+        "temperature": (214.5826511082, 261.4420066818, 308.8738841988, 30.8194143197),
+        "air_density": (0.0782056289, 0.7638509944, 1.4525344922, 0.4051954154),
+        "exner_function": (0.4292292014, 0.8190314082, 1.0113237199, 0.1858690713),
+    }
+    for field, reference in reference_statistics.items():
+        values = np.asarray(daily_states[-1][field])
+        actual = (
+            float(np.min(values)),
+            float(np.mean(values)),
+            float(np.max(values)),
+            float(np.std(values)),
+        )
+        np.testing.assert_allclose(actual, reference, rtol=1.0e-8, atol=1.0e-10)
+
+    anomaly = np.asarray(
+        daily_states[-1]["temperature"].isel(level=plot_level)
+        - daily_states[0]["temperature"].isel(level=plot_level)
+    )
+    anomaly_statistics = (
+        float(np.min(anomaly)),
+        float(np.mean(anomaly)),
+        float(np.max(anomaly)),
+        float(np.std(anomaly)),
+    )
+    np.testing.assert_allclose(
+        anomaly_statistics,
+        (-2.7651799491, 0.1989061916, 5.2670710580, 2.7846084119),
+        rtol=1.0e-8,
+        atol=1.0e-10,
+    )
 
     final_figure = helper.plot_field(
         grid,
