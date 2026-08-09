@@ -42,7 +42,7 @@ jobs:
           PY
 
       - name: Ruff
-        run: make lint
+        run: make lint VENV_PYTHON=python
 
       - name: Tests
         run: python -m pytest -q
@@ -68,7 +68,7 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Validate compiled JW result against the reference
-        run: make test-slow
+        run: make test-slow VENV_PYTHON=python
 
   notebook:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -91,4 +91,4 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Execute the demo notebook
-        run: make notebook-check
+        run: make notebook-check VENV_PYTHON=python
