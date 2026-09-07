@@ -62,7 +62,7 @@ from icon4py.model.common.states import (
 )
 from icon4py.model.common.states import (
     nonhydro_states,
-    tracer_state,
+    tracer_states,
 )
 from icon4py.model.common.states import (
     prognostic_state as prognostics,
@@ -71,14 +71,16 @@ from icon4py.model.common.topography import config as topo_config
 from icon4py.model.common.topography.analytical import (
     jablonowski_williamson as topo_jw,
 )
-from icon4py.model.standalone_driver import (
+from icon4py.model.driver import (
     config as driver_config,
 )
-from icon4py.model.standalone_driver import (
+from icon4py.model.driver import (
+    driver as icon_driver_module,
+)
+from icon4py.model.driver import (
     driver_io,
     driver_states,
     driver_utils,
-    standalone_driver,
 )
 from matplotlib import colors as matplotlib_colors
 from matplotlib.collections import PolyCollection
@@ -112,6 +114,7 @@ class StateRuntime:
     grid: dict
     driver: Any
     prognostic_state_now: Any
+    tracer_state_now: Any = None
     solve_nonhydro_diagnostic_state: Any = None
     diagnostics_computer: Any = None
     driver_states: Any = None
@@ -1165,7 +1168,7 @@ def build_icon4py_config(grid, state, testcase, config):
         ),
         nonhydrostatic=solve_nonhydro.NonHydrostaticConfig(),
         diffusion=diffusion.DiffusionConfig(),
-        tracer_config=tracer_state.TracerConfig.none(),
+        tracer_config=tracer_states.TracerConfig.none(),
         tracer_advection=None,
     )
 
@@ -1185,7 +1188,7 @@ def init_state(grid, state, testcase="JW26", config=None):
         "and initial-condition operators are real stencils",
         level="debug",
     )
-    icon_driver = standalone_driver.initialize_driver(
+    icon_driver = icon_driver_module.initialize_driver(
         config=icon_config,
         grid_manager=grid_runtime_value.manager,
         process_props=grid_runtime_value.process_props,
@@ -1196,6 +1199,10 @@ def init_state(grid, state, testcase="JW26", config=None):
 
     log(config, "[init] allocating prognostic fields: rho, theta_v, exner, vn, w")
     prognostic_state_now = prognostics.initialize_prognostic_state(
+        grid=icon_driver.grid,
+        allocator=grid_runtime_value.allocator,
+    )
+    tracer_state_now = tracer_states.initialize_tracer_state(
         grid=icon_driver.grid,
         allocator=grid_runtime_value.allocator,
         tracer_config=icon_config.tracer_config,
@@ -1216,6 +1223,7 @@ def init_state(grid, state, testcase="JW26", config=None):
         grid=icon_driver.grid,
         static_fields=icon_driver.static_field_factories,
         prognostic_state_now=prognostic_state_now,
+        tracer_state_now=tracer_state_now,
         backend=icon_driver.backend,
         exchange=icon_driver.exchange,
         solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
@@ -1226,6 +1234,7 @@ def init_state(grid, state, testcase="JW26", config=None):
         grid=grid,
         driver=icon_driver,
         prognostic_state_now=prognostic_state_now,
+        tracer_state_now=tracer_state_now,
         solve_nonhydro_diagnostic_state=solve_nonhydro_diagnostic_state,
     )
     state.runtime = state_runtime
@@ -1342,6 +1351,7 @@ def create_model(grid, state, config=None):
         exchange=icon_driver.exchange,
         static_fields=icon_driver.static_field_factories,
         prognostic_state_now=runtime.prognostic_state_now,
+        tracer_state_now=runtime.tracer_state_now,
         diagnostic_state=diagnostic_state,
         experiment_config=icon_config,
         solve_nonhydro_diagnostic_state=runtime.solve_nonhydro_diagnostic_state,

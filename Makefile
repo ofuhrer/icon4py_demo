@@ -26,6 +26,8 @@ notebook-check:
 	mkdir -p /tmp/icon4py-demo-nbconvert
 	PATH="$(PWD)/$(VENV)/bin:$$PATH" $(VENV_PYTHON) -m nbconvert \
 		--execute --to notebook \
+		--ExecutePreprocessor.kernel_name=python3 \
+		--ExecutePreprocessor.timeout=3300 \
 		--output-dir /tmp/icon4py-demo-nbconvert \
 		--output icon4py_demo.executed.ipynb \
 		icon4py_demo.ipynb

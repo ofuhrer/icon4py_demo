@@ -22,7 +22,7 @@ DERIVED_CONNECTIVITY_OFFSETS = frozenset(
 def derive_neighbor_tables(neighbor_tables: Mapping[Any, Any]) -> dict[Any, Any]:
     """Derive secondary tables through ICON4Py's current compatibility hook.
 
-    ICON4Py 0.3.0 does not expose this operation publicly. Keeping the private
+    ICON4Py 0.4.1 does not expose this operation publicly. Keeping the private
     import and contract check here gives upgrades one small, directly tested
     place to adapt without leaking implementation details into the demo helper.
     """

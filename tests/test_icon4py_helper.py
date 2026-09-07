@@ -429,7 +429,7 @@ def test_init_state_initializes_driver_once_and_reuses_its_context(monkeypatch):
         state_arg["xarray"] = xr.Dataset()
 
     monkeypatch.setattr(
-        helper.standalone_driver, "initialize_driver", fake_initialize_driver
+        helper.icon_driver_module, "initialize_driver", fake_initialize_driver
     )
     monkeypatch.setattr(
         helper,
@@ -464,8 +464,12 @@ def test_init_state_initializes_driver_once_and_reuses_its_context(monkeypatch):
     assert calls["initialize_prognostic_state"] == {
         "grid": icon_grid,
         "allocator": allocator,
-        "tracer_config": icon_driver.config.tracer_config,
     }
+    assert not list(runtime.tracer_state_now.active_fields())
+    assert (
+        calls["initial_condition_create"]["tracer_state_now"]
+        is runtime.tracer_state_now
+    )
     assert calls["initial_condition_create"]["grid"] is icon_grid
     assert calls["initial_condition_create"]["static_fields"] is static_fields
     assert calls["initial_condition_create"]["backend"] is backend
@@ -537,7 +541,7 @@ def test_create_model_reuses_initialized_driver_and_assembles_states(monkeypatch
         calls["validate_granule_state_consistency"] = kwargs
 
     monkeypatch.setattr(
-        helper.standalone_driver, "initialize_driver", fail_initialize_driver
+        helper.icon_driver_module, "initialize_driver", fail_initialize_driver
     )
     monkeypatch.setattr(
         helper.diagnostics,
@@ -686,8 +690,10 @@ def test_compiled_notebook_workflow_matches_one_day_jw_reference(monkeypatch, tm
     np.testing.assert_allclose(
         anomaly_statistics,
         (-2.7651799491, 0.1989061916, 5.2670710580, 2.7846084119),
-        rtol=1.0e-8,
-        atol=1.0e-10,
+        # Linux x86 and macOS ARM differ by up to 4.9e-6 K with 0.3.0.
+        # Keep the historical reference, with a 1e-5 K absolute error budget.
+        rtol=0,
+        atol=1.0e-5,
     )
 
     final_figure = helper.plot_field(
